@@ -1,0 +1,7 @@
+pm4py>=2.7
+simpy>=4.1
+streamlit>=1.40
+plotly>=5.20
+pandas>=2.0
+numpy>=1.26
+scipy>=1.11
