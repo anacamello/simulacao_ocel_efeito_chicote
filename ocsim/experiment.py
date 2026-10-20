@@ -142,7 +142,12 @@ def parallel_supported() -> bool:
     Por isso a interface deixa a opção ligada só no Linux. Nos outros sistemas
     o usuário pode ligá-la; se travar, o programa volta sozinho ao modo de um
     núcleo (ver run_experiment)."""
-    return sys.platform.startswith("linux")
+    # No Streamlit Community Cloud (servidor Linux na nuvem, com pouca memória e
+    # poucos núcleos) cada processo auxiliar copiaria os dados do modelo; por
+    # segurança, a opção também vem desligada lá. O Streamlit Cloud executa os
+    # apps a partir da pasta /mount/src e com o usuário "adminuser".
+    in_streamlit_cloud = os.path.isdir("/mount/src") or os.environ.get("HOME", "") == "/home/adminuser"
+    return sys.platform.startswith("linux") and not in_streamlit_cloud
 
 
 def _kill_pool(ex: ProcessPoolExecutor):
