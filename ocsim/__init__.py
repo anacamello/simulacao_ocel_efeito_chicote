@@ -107,3 +107,8 @@ Saída do terminal (stdout)
 JSON
     Formato de arquivo de texto para dados estruturados; o OCEL 2.0 usa JSON.
 """
+
+# Versão do pacote. O app.py confere este número ao iniciar: se os arquivos da
+# pasta ocsim/ forem de uma versão diferente da do app.py (por exemplo, quando
+# só parte dos arquivos foi atualizada no servidor), o app avisa em vez de falhar.
+__version__ = "2026.10.20"
