@@ -25,6 +25,9 @@ GLOSSÁRIO RÁPIDO
 * Achatamento (flattening): escolher UM tipo de objeto como "caso" e gerar um
   log tradicional (caso, atividade, timestamp) – necessário para usar as
   técnicas clássicas (DFG, variantes, desempenho).
+
+Termos de programação (DataFrame, groupby, merge...) estão explicados no
+glossário do arquivo ocsim/__init__.py.
 """
 from __future__ import annotations
 
@@ -38,13 +41,45 @@ import pandas as pd
 
 
 def _quiet():
-    """O PM4Py imprime um banner de licença a cada importação/chamada.
-    Este gerenciador de contexto redireciona a saída para "lugar nenhum"."""
+    """Silencia as mensagens que o PM4Py escreve no terminal.
+
+    Toda vez que é carregado, o PM4Py escreve no terminal um aviso de várias
+    linhas sobre a licença de uso dele (AGPL). Esse aviso não tem utilidade para
+    o projeto e polui a tela. Esta função cria um "desvio" temporário: tudo o
+    que for escrito no terminal (com print) enquanto o desvio estiver ativo vai
+    para uma área de texto descartável, em vez de aparecer na tela.
+
+    Uso:   with _quiet():
+               ...código do PM4Py...      ← mensagens escritas aqui são descartadas
+    Ao sair do bloco ``with``, o terminal volta ao normal."""
     return contextlib.redirect_stdout(io.StringIO())
 
 
-with _quiet():
-    import pm4py  # noqa: E402
+class _LazyPM4Py:
+    """Carrega o PM4Py somente na primeira vez em que ele é realmente usado.
+
+    Por que isso existe: carregar (importar) o PM4Py leva vários segundos. A
+    simulação em si não usa o PM4Py — só a leitura do OCEL e a mineração usam.
+    Quando a simulação roda em vários núcleos ao mesmo tempo no Windows ou no
+    macOS, cada núcleo começa um Python do zero e carregaria o PM4Py à toa,
+    atrasando (ou até travando) o início.
+
+    Como funciona: ``pm4py`` abaixo não é a biblioteca, e sim um
+    "intermediário". Na primeira vez que o código pede algo dele (por exemplo
+    ``pm4py.read_ocel2_json``), o intermediário carrega a biblioteca de verdade
+    e repassa o pedido; nas vezes seguintes, só repassa."""
+    _mod = None
+
+    def __getattr__(self, name):
+        # chamado automaticamente quando o código pede pm4py.<algo>
+        if _LazyPM4Py._mod is None:          # primeira vez: carrega a biblioteca
+            with _quiet():
+                import pm4py as _m  # noqa: E402
+            _LazyPM4Py._mod = _m
+        return getattr(_LazyPM4Py._mod, name)
+
+
+pm4py = _LazyPM4Py()  # use "pm4py.funcao(...)" normalmente no resto do arquivo
 
 
 # Ordem de exibição dos tipos de objeto (transacionais primeiro, estruturais depois)
@@ -61,7 +96,8 @@ OT_ORDER = [
     "Supplier",
 ]
 
-# Nomes das colunas padrão do PM4Py para OCEL (abreviados para deixar o código legível)
+# O PM4Py entrega as tabelas do OCEL com colunas de nomes longos ("ocel:eid"...).
+# Guardamos esses nomes em variáveis curtas para o código ficar mais legível.
 EID, ACT, TS, OID, OTYPE, QUAL = (
     "ocel:eid",        # id do evento
     "ocel:activity",   # nome da atividade
@@ -77,7 +113,10 @@ EID, ACT, TS, OID, OTYPE, QUAL = (
 # ===========================================================================
 @dataclass
 class OcelData:
-    """Tabelas derivadas do OCEL (formato pandas, fáceis de cachear)."""
+    """Ficha com o conteúdo do OCEL já convertido em tabelas (DataFrames do pandas).
+
+    É o que este módulo devolve depois de ler o arquivo, e o que os outros
+    módulos recebem para trabalhar. Cada campo abaixo é uma das tabelas."""
 
     ocel: object                  # objeto OCEL original do PM4Py (usado nas funções de descoberta)
     events: pd.DataFrame          # 1 linha por evento: atividade, timestamp, atributos e o IL envolvido
@@ -88,7 +127,7 @@ class OcelData:
     start: pd.Timestamp           # início do horizonte (1º dia)
     end: pd.Timestamp             # fim do horizonte
 
-    @property
+    @property  # permite escrever d.horizon_days (sem parênteses), como se fosse um campo
     def horizon_days(self) -> float:
         """Duração do log em dias (731 no arquivo fornecido)."""
         return (self.end - self.start).total_seconds() / 86400
@@ -107,6 +146,8 @@ def load_ocel(path: str) -> OcelData:
     # 2) quase todo evento envolve exatamente um ItemLocation (IL = item × local).
     #    Guardamos o IL em uma coluna 'il' da tabela de eventos para facilitar
     #    as análises por IL (demanda, estoque, pedidos).
+    #    Passo a passo: pega as relações evento→objeto cujo objeto é um ItemLocation,
+    #    fica com uma por evento e junta (merge, como um PROCV) à tabela de eventos.
     il = rel[rel[OTYPE] == "ItemLocation"][[EID, OID]].drop_duplicates(EID).rename(columns={OID: "il"})
     ev = ev.merge(il, on=EID, how="left").sort_values(TS).reset_index(drop=True)
 
@@ -114,7 +155,8 @@ def load_ocel(path: str) -> OcelData:
     objs = ocel.objects.copy()
     oc = ocel.object_changes.copy() if ocel.object_changes is not None else pd.DataFrame()
     o2o = ocel.o2o.copy()
-    # acrescenta o tipo do objeto de origem e o do destino (ex.: PurchaseOrderItem → Supplier)
+    # a tabela O2O só traz os ids dos dois objetos; aqui buscamos (merge) o tipo de
+    # cada um, para saber, por exemplo, que a ligação é PurchaseOrderItem → Supplier
     o2o = o2o.merge(objs[[OID, OTYPE]], on=OID).merge(
         objs[[OID, OTYPE]].rename(columns={OID: OID + "_2", OTYPE: OTYPE + "_2"}), on=OID + "_2"
     )
@@ -135,7 +177,8 @@ def object_type_summary(d: OcelData) -> pd.DataFrame:
     linked = d.relations.groupby(OTYPE)[OID].nunique()
     nev = d.relations.groupby(OTYPE)[EID].nunique()
     with _quiet():
-        ot_acts = pm4py.ocel_object_type_activities(d.ocel)  # {tipo: {atividades}}
+        # dicionário {tipo de objeto: conjunto de atividades em que ele aparece}
+        ot_acts = pm4py.ocel_object_type_activities(d.ocel)
     df = pd.DataFrame({"objetos (total)": total, "objetos em eventos": linked, "eventos relacionados": nev})
     df["atividades"] = [", ".join(sorted(ot_acts.get(t, []))) for t in df.index]
     df["nº atividades"] = [len(ot_acts.get(t, [])) for t in df.index]
@@ -144,7 +187,8 @@ def object_type_summary(d: OcelData) -> pd.DataFrame:
 
 def activity_summary(d: OcelData) -> pd.DataFrame:
     """Matriz atividade × tipo de objeto com o nº de relações E2O."""
-    cnt = d.events[ACT].value_counts().rename("eventos")
+    cnt = d.events[ACT].value_counts().rename("eventos")   # nº de eventos de cada atividade
+    # groupby + count: conta as relações por (atividade, tipo); unstack gira os tipos para colunas
     m = d.relations.groupby([ACT, OTYPE])[OID].count().unstack(fill_value=0)
     return pd.concat([cnt, m], axis=1).fillna(0).astype(int).sort_values("eventos", ascending=False)
 
@@ -237,7 +281,9 @@ def dfg_durations(fl: pd.DataFrame) -> pd.DataFrame:
     É daqui que saem as observações usadas para ajustar as distribuições de
     duração (ex.: todos os tempos 'Supplier Confirmation Received → Goods Receipt')."""
     f = fl[["case", "act", "ts"]].copy()
-    # shift(-1) dentro de cada caso = "próximo evento do mesmo objeto"
+    # shift(-1) dentro de cada caso: coloca, na mesma linha, o evento atual e o
+    # PRÓXIMO evento do mesmo objeto. Ex.: na linha de "PO Created" aparecem
+    # também "Supplier Confirmation" e o horário dela — daí sai a duração.
     f["next_act"] = f.groupby("case")["act"].shift(-1)
     f["next_ts"] = f.groupby("case")["ts"].shift(-1)
     f = f.dropna(subset=["next_act"])  # o último evento não tem sucessor
@@ -249,8 +295,9 @@ def performance_dfg_table(fl: pd.DataFrame) -> pd.DataFrame:
     """DFG de desempenho do PM4Py como tabela: frequência e tempos (horas) de cada arco."""
     log = fl.rename(columns={"case": "case:concept:name", "act": "concept:name", "ts": "time:timestamp"})
     with _quiet():
-        perf, sa, ea = pm4py.discover_performance_dfg(log)  # tempos em segundos
-        freq, _, _ = pm4py.discover_dfg(log)                # frequências
+        # DFG = grafo "diretamente seguido por": quais atividades vêm logo após quais.
+        perf, sa, ea = pm4py.discover_performance_dfg(log)  # tempos de cada arco, em segundos
+        freq, _, _ = pm4py.discover_dfg(log)                # quantas vezes cada arco ocorre
     rows = []
     for (a, b), st in perf.items():
         rows.append(
@@ -279,7 +326,10 @@ def activity_counts_per_object(d: OcelData, otype: str) -> pd.DataFrame:
     Inclui objetos com zero ocorrências (importante para estimar
     probabilidades: ex.: % de POs que têm 'Receipt Rejected')."""
     r = d.relations[d.relations[OTYPE] == otype]
+    # conta eventos por (objeto, atividade) e gira as atividades para colunas
     m = r.groupby([OID, ACT])[EID].nunique().unstack(fill_value=0)
+    # objetos que nunca tiveram uma atividade não aparecem na contagem;
+    # reindex inclui todos os objetos do tipo, com 0 onde faltar
     all_objs = d.objects.loc[d.objects[OTYPE] == otype, OID]
     return m.reindex(all_objs, fill_value=0)
 
@@ -300,7 +350,7 @@ def o2o_cardinalities(d: OcelData) -> pd.DataFrame:
         n_b = (d.objects[OTYPE] == tb).sum()
         per_a = g.groupby(OID)[OID + "_2"].nunique()      # nº de destinos por origem
         per_b = g.groupby(OID + "_2")[OID].nunique()      # nº de origens por destino
-        # reindex inclui objetos sem nenhuma ligação (contagem 0)
+        # objetos sem nenhuma ligação não aparecem na contagem; reindex os inclui com 0
         a_full = per_a.reindex(d.objects.loc[d.objects[OTYPE] == ta, OID], fill_value=0)
         b_full = per_b.reindex(d.objects.loc[d.objects[OTYPE] == tb, OID], fill_value=0)
         rows.append(
@@ -341,7 +391,9 @@ def object_interactions(d: OcelData) -> pd.DataFrame:
     Dois objetos 'interagem' quando aparecem juntos em algum evento. Para cada
     par de tipos mostra quantos objetos do outro tipo cada objeto encontra."""
     r = d.relations[[EID, OID, OTYPE]].drop_duplicates()
-    m = r.merge(r, on=EID, suffixes=("", "_b"))       # todos os pares no mesmo evento
+    # junta a tabela com ela mesma pelo id do evento: cada linha passa a ser um
+    # PAR de objetos que participaram do mesmo evento
+    m = r.merge(r, on=EID, suffixes=("", "_b"))
     m = m[m[OTYPE] != m[OTYPE + "_b"]]                 # só pares de tipos diferentes
     pairs = m[[OID, OTYPE, OID + "_b", OTYPE + "_b"]].drop_duplicates()
     per = pairs.groupby([OTYPE, OTYPE + "_b", OID])[OID + "_b"].nunique()

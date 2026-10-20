@@ -12,24 +12,38 @@ log".
 
 COMO O AJUSTE É FEITO (função ``fit_numeric``)
 ---------------------------------------------
-1. Recebe as observações do log (ex.: 575 tempos "proposta criada → aprovada").
-2. Para cada distribuição candidata (normal, exponencial, gama, lognormal,
-   Weibull, uniforme) estima os parâmetros por MÁXIMA VEROSSIMILHANÇA (MLE,
-   função ``fit`` do scipy).
-3. Calcula o AIC = 2k − 2·ln(L)  (k = nº de parâmetros, L = verossimilhança).
-   Quanto MENOR o AIC, melhor o equilíbrio entre aderência e simplicidade.
-4. Escolhe a candidata de menor AIC e registra o teste de Kolmogorov–Smirnov
-   (KS) como medida de aderência (estatística D e p-valor).
+1. Recebe as observações do log (ex.: os 575 tempos "proposta criada →
+   proposta aprovada").
+2. Testa 6 distribuições candidatas: normal, exponencial, gama, lognormal,
+   Weibull e uniforme. Para cada uma, encontra os parâmetros (média, forma,
+   escala...) pelo método da MÁXIMA VEROSSIMILHANÇA: escolhe os valores dos
+   parâmetros que tornam MAIS PROVÁVEL ter observado exatamente esses dados.
+   Quem faz essa conta é a função ``fit`` da biblioteca SciPy.
+3. Compara as candidatas pelo AIC (Critério de Informação de Akaike):
+        AIC = 2k − 2·ln(L)
+   onde k = nº de parâmetros da distribuição e L = verossimilhança (o quanto
+   ela "explica" os dados). O AIC premia o bom ajuste e penaliza
+   distribuições com mais parâmetros. Quanto MENOR o AIC, melhor.
+4. Fica com a de menor AIC e registra o teste de Kolmogorov–Smirnov (KS), que
+   mede a maior distância entre a curva acumulada dos dados e a da
+   distribuição (estatística D) e dá um p-valor. p-valor baixo (< 0,05) indica
+   que a distribuição não descreve perfeitamente os dados — comum com
+   milhares de observações, quando qualquer pequena diferença vira
+   "significativa". Por isso a interface também oferece o modo empírico.
 5. Casos especiais:
    - nenhuma observação           → constante 0;
    - todas as observações iguais  → constante;
-   - menos de 15 observações      → distribuição EMPÍRICA (sorteia um dos
-     valores observados — "bootstrap"), pois ajustar 2–3 parâmetros com
-     poucos pontos é pouco confiável.
+   - menos de 15 observações      → distribuição EMPÍRICA: em vez de uma curva
+     teórica, sorteia diretamente um dos valores observados (técnica chamada
+     "bootstrap" ou reamostragem). Com tão poucos pontos, estimar 2 ou 3
+     parâmetros seria pouco confiável.
 
 Variáveis categóricas (ex.: ``carrier``) usam as frequências relativas
 observadas (``fit_categorical``); contagens inteiras (ex.: nº de "Goods
 Receipt" por pedido) usam a distribuição discreta empírica (``fit_discrete``).
+
+Termos de programação (classe, dataclass, gerador de números aleatórios...)
+estão explicados no glossário do arquivo ocsim/__init__.py.
 """
 from __future__ import annotations
 
@@ -55,7 +69,9 @@ CANDIDATES = {
 
 # abaixo deste nº de observações usamos a distribuição empírica
 MIN_SAMPLES_PARAMETRIC = 15
-# para não deixar o ajuste lento, usamos no máximo 4000 observações (subamostra aleatória)
+# Com muitas observações (ex.: 16 mil pedidos de venda) o ajuste fica lento.
+# Nesses casos usamos 4000 observações sorteadas ao acaso (uma "subamostra"):
+# o resultado é praticamente o mesmo e o cálculo fica muito mais rápido.
 MAX_FIT_SAMPLES = 4000
 
 
@@ -91,18 +107,27 @@ class Dist:
 
     # ----------------------------------------------------------- sorteio
     def sample(self, rng: np.random.Generator, mode: str | None = None) -> Any:
-        """Sorteia UM valor. ``rng`` é o gerador de números aleatórios da
-        replicação (garante reprodutibilidade pela semente)."""
+        """Sorteia UM valor desta distribuição.
+
+        ``rng`` é o gerador de números aleatórios da replicação. Cada replicação
+        tem o seu, criado a partir de uma semente: com a mesma semente, os
+        sorteios se repetem exatamente (resultado reproduzível).
+        ``mode`` permite forçar o sorteio 'empirical' (valores do log) ou
+        'parametric' (curva ajustada)."""
         mode = mode or self.mode
 
         # (a) valor constante
         if self.kind == "const":
             return self.params[0]
 
-        # (b) categórica / discreta: sorteio pela função acumulada.
-        #     Ex.: probs = [0.98, 0.02] → cum = [0.98, 1.0]; um número uniforme
-        #     u ∈ [0,1) cai no primeiro intervalo com prob. 0,98.
-        #     A acumulada é calculada uma única vez e guardada (_cum) por desempenho.
+        # (b) categórica / discreta: sorteio pela probabilidade ACUMULADA.
+        #     Exemplo com carrier: probs = [0,98 (SIM), 0,02 (FORCED)].
+        #     A acumulada é [0,98; 1,00], que divide o intervalo de 0 a 1 em
+        #     faixas: [0 a 0,98) → SIM e [0,98 a 1) → FORCED. Sorteamos um número
+        #     ao acaso entre 0 e 1 e vemos em que faixa ele cai (searchsorted
+        #     faz essa busca). Assim SIM sai em 98% das vezes.
+        #     A acumulada é calculada só na primeira vez e guardada em _cum,
+        #     porque este sorteio é feito milhares de vezes por replicação.
         if self.kind in ("categorical", "discrete"):
             cum = self.__dict__.get("_cum")
             if cum is None:
@@ -111,10 +136,10 @@ class Dist:
                 self.__dict__["_cum"] = cum
             return self.values[int(np.searchsorted(cum, rng.random(), side="right"))]
 
-        # (c) empírica: escolhe uma observação ao acaso (bootstrap)
+        # (c) empírica: escolhe ao acaso uma das observações do log (reamostragem)
         if self.kind == "empirical" or mode == "empirical":
             x = float(self.values[rng.integers(len(self.values))])
-        # (d) paramétrica: sorteia da distribuição teórica ajustada
+        # (d) paramétrica: sorteia da curva teórica ajustada (ex.: Weibull do lead time)
         else:
             x = _fast_rvs(self.name, self.params, rng)
             # limita ao intervalo observado no log, evitando valores absurdos
@@ -142,7 +167,8 @@ class Dist:
 
     @property
     def std(self) -> float:
-        """Desvio-padrão (amostral)."""
+        """Desvio-padrão. ``ddof=1`` = desvio "amostral" (divide por n − 1),
+    o usual quando os dados são uma amostra e não a população inteira."""
         if self.kind == "const":
             return 0.0
         if self.kind == "discrete":
@@ -191,12 +217,15 @@ class Dist:
 # Funções auxiliares
 # ===========================================================================
 def _fast_rvs(name: str, p: tuple, rng: np.random.Generator) -> float:
-    """Sorteio rápido usando o numpy diretamente.
+    """Sorteia um valor de uma distribuição paramétrica, de forma rápida.
 
-    O ``scipy.stats.<dist>.rvs`` é ~50x mais lento por chamada; como cada
-    replicação sorteia centenas de milhares de valores, reescrevemos o sorteio
-    de cada distribuição com a parametrização do scipy (loc = deslocamento,
-    escala = fator multiplicativo)."""
+    O SciPy tem uma função própria de sorteio, mas ela é cerca de 50 vezes
+    mais lenta por chamada. Como cada replicação faz centenas de milhares de
+    sorteios, usamos o numpy diretamente, aplicando a mesma convenção de
+    parâmetros do SciPy:
+      loc    = deslocamento (quanto a curva é empurrada para a direita);
+      escala = fator que estica ou encolhe a curva;
+      forma  = parâmetro que muda o formato (ex.: assimetria da Weibull)."""
     if name == "normal":        # params = (μ, σ)
         return p[0] + p[1] * rng.standard_normal()
     if name == "exponencial":   # params = (loc, escala)
@@ -257,10 +286,12 @@ def fit_numeric(
     ----------
     samples    : observações do log.
     integer    : se True, os valores sorteados serão arredondados (ex.: quantidades).
-    nonneg     : se True, fixa loc ≤ mínimo para distribuições de suporte positivo
-                 (tempos e quantidades não podem ser negativos).
+    nonneg     : se True, impede que as curvas que só valem para números
+                 positivos (gama, lognormal, Weibull, exponencial) sejam
+                 deslocadas para valores negativos — tempos e quantidades
+                 nunca são negativos.
     candidates : restringe as distribuições testadas (opcional).
-    seed       : semente da subamostragem (reprodutibilidade).
+    seed       : semente usada para sortear a subamostra (mesma semente → mesmo ajuste).
     """
     # 1) limpa valores ausentes/infinitos
     x = np.asarray([v for v in samples if v is not None and np.isfinite(v)], dtype=float)
@@ -269,7 +300,7 @@ def fit_numeric(
     # 2) casos degenerados
     if n == 0:
         return Dist("const", params=(0.0,), integer=integer, n=0)
-    if np.ptp(x) < 1e-12:  # ptp = máximo − mínimo → todos iguais
+    if np.ptp(x) < 1e-12:  # ptp = máximo − mínimo; se é zero, todos os valores são iguais
         return Dist("const", params=(int(x[0]) if integer else float(x[0]),), values=x, integer=integer, n=n)
     lower = float(x.min())
     upper = float(x.max())
@@ -289,26 +320,32 @@ def fit_numeric(
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")  # o scipy emite avisos em ajustes difíceis
                 if nm in ("exponencial", "gama", "lognormal", "weibull") and nonneg:
-                    # 'floc' fixa o deslocamento logo abaixo do mínimo observado,
-                    # garantindo suporte não negativo e um ajuste mais estável
+                    # floc = "loc fixo": em vez de deixar o SciPy escolher o
+                    # deslocamento da curva, fixamos em 0 (ou logo abaixo do menor
+                    # valor observado). Isso garante que a curva não gere valores
+                    # negativos e deixa o ajuste mais estável.
                     params = dist.fit(xf, floc=min(0.0, xf.min() - 1e-9))
                 else:
                     params = dist.fit(xf)
-                ll = np.sum(dist.logpdf(xf, *params))      # log-verossimilhança
+                # log-verossimilhança: soma do logaritmo da densidade de cada observação
+                # (quanto maior, melhor a curva explica os dados)
+                ll = np.sum(dist.logpdf(xf, *params))
                 if not np.isfinite(ll):
                     continue
                 k = len(params)
                 aic = 2 * k - 2 * ll                        # critério de Akaike
                 ks = stats.kstest(xf, dist.cdf, args=params)  # aderência
                 ranking.append((nm, float(aic), float(ks.statistic), float(ks.pvalue), params))
-        except Exception:  # o ajuste numérico pode falhar para alguma candidata
+        except Exception:
+            # algumas candidatas não conseguem ser ajustadas a certos dados
+            # (o cálculo numérico não converge); nesse caso, apenas pulamos para a próxima
             continue
 
     # 5) se nenhuma candidata funcionou, recorre à empírica
     if not ranking:
         return Dist("empirical", values=x, integer=integer, n=n, lower=lower, upper=upper, mode="empirical")
 
-    # 6) escolhe a de menor AIC
+    # 6) ordena as candidatas pelo AIC (2º item de cada registro) e fica com a primeira
     ranking.sort(key=lambda r: r[1])
     nm, aic, ks, ksp, params = ranking[0]
     return Dist(

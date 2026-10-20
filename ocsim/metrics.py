@@ -4,7 +4,7 @@ metrics.py — medidas do efeito chicote e indicadores de desempenho
 
 PAPEL NO PROJETO
 ----------------
-Transforma as séries diárias geradas pela simulação (ou extraídas do log real)
+Transforma as séries diárias geradas pela simulação (ou extraídas do log original)
 nos números que respondem à pergunta do trabalho: qual regra de reposição
 amplifica menos a variabilidade dos pedidos?
 
@@ -34,15 +34,23 @@ import pandas as pd
 
 
 def bucket(series: np.ndarray, size: int) -> np.ndarray:
-    """Soma a última dimensão em baldes de ``size`` dias (o resto final é descartado).
-    Ex.: 731 dias com size=7 → 104 semanas."""
+    """Soma as séries diárias em "baldes" de ``size`` dias (ex.: semanas).
+
+    Ex.: 731 dias com size=7 → 104 semanas (os 3 dias que sobram no fim são
+    descartados, para todas as semanas terem 7 dias).
+    Como funciona: a matriz ILs × 728 dias é remodelada (reshape) para
+    ILs × 104 semanas × 7 dias, e então somamos os 7 dias de cada semana."""
     n = series.shape[-1] // size
     s = series[..., : n * size]
     return s.reshape(*series.shape[:-1], n, size).sum(-1)
 
 
 def _ratio(num: np.ndarray, den: np.ndarray) -> float:
-    """Var(num) / Var(den); NaN se o denominador não varia (ex.: IL sem demanda)."""
+    """Razão de variâncias Var(num) / Var(den).
+    ``ddof=1`` = variância amostral (divide por n − 1).
+    Devolve NaN ("não é um número", isto é, valor indefinido) quando o
+    denominador não varia — ex.: um IL sem nenhuma demanda —, pois não há
+    como dividir por zero."""
     vd = np.var(den, ddof=1)
     if vd <= 1e-12:
         return np.nan

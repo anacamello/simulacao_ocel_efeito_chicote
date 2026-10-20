@@ -11,11 +11,28 @@ propostas de reposição, pedidos de compra, entregas e recebimentos.
 
 COMO O SIMPY FUNCIONA (resumo)
 -------------------------------
-* ``simpy.Environment`` é o relógio da simulação (aqui, 1 unidade = 1 dia).
-* Um PROCESSO é uma função geradora (usa ``yield``). Cada ``yield
-  env.timeout(t)`` diz "espere t dias"; enquanto isso, outros processos rodam.
-* ``env.process(f())`` inicia um processo; ``env.run(until=H)`` roda até o
-  instante H.
+Uma simulação de eventos discretos não avança o tempo de segundo em segundo:
+ela pula direto de um acontecimento para o próximo.
+
+* ``simpy.Environment`` é o relógio da simulação. Aqui, 1 unidade = 1 dia;
+  0,5 = meio-dia; 0,333 = 8h da manhã.
+* Um PROCESSO é uma sequência de passos com esperas no meio, escrita como uma
+  função que pode "pausar" (função geradora — ver glossário em __init__.py).
+  ``yield env.timeout(2.5)`` quer dizer: "pause este processo por 2,5 dias de
+  simulação e depois continue da linha seguinte".
+* Muitos processos existem ao mesmo tempo (um por pedido de venda, um por
+  reposição...). O SimPy mantém uma agenda e sempre executa o próximo
+  acontecimento no tempo.
+* ``env.process(f())`` coloca um processo na agenda; ``env.run(until=H)`` roda
+  a agenda até o instante H.
+
+Exemplo de linha do tempo de UM pedido de compra:
+   dia 10,7  proposta criada        → yield timeout(1,5)  (aprovação)
+   dia 12,2  proposta aprovada      → yield timeout(0,01) (emissão do PO)
+   dia 12,2  PO criado              → yield timeout(22)   (lead time)
+   dia 34,2  mercadoria recebida → estoque do IL aumenta
+Enquanto esse processo está "esperando", centenas de outros (pedidos de
+venda, outras reposições) acontecem normalmente.
 
 ESTRUTURA CENTRADA EM OBJETOS (inspirada no OCPS, Knopp & van der Aalst)
 ------------------------------------------------------------------------
@@ -61,8 +78,9 @@ REVIEW_HOUR = 17.5 / 24  # hora padrão da revisão (17h30) se não houver distr
 
 # ===========================================================================
 # Estado de estoque de UM ItemLocation durante a simulação
+# (os valores mudam a cada evento: venda, recebimento, ajuste...)
 # ===========================================================================
-@dataclass
+@dataclass  # "ficha" com campos (ver glossário)
 class ILState:
     p: ILParams                    # parâmetros fixos do IL (vindos do log)
     pol: PolicyState               # estado da política de reposição (previsão, s, S)
@@ -70,12 +88,17 @@ class ILState:
     reserved: float = 0.0          # reservado para pedidos de venda ainda não expedidos
     on_order: float = 0.0          # pedidos de compra emitidos e não recebidos
     pending: float = 0.0           # propostas criadas que ainda não viraram PO
-    backlog: deque = field(default_factory=deque)  # fila de pendências: [[id do SOI, quantidade]]
+    # fila de pendências na ordem de chegada (o primeiro a entrar é o primeiro
+    # a ser atendido). Cada item é [id do pedido de venda, quantidade que falta].
+    # "deque" é um tipo de lista eficiente para tirar itens do começo.
+    backlog: deque = field(default_factory=deque)
     backorder: float = 0.0         # total pendente
     data_gap: bool = False         # True durante uma lacuna de dados (revisões suspensas)
     asis_S: float = 0.0            # nível máximo da política atual (pode mudar no tempo)
     consumed_today: float = 0.0    # demanda acumulada no dia (alimenta a previsão)
 
+    # @property: permite escrever st.ip_log (sem parênteses), como se fosse um campo,
+    # mas o valor é calculado na hora a partir dos outros campos
     @property
     def ip_log(self) -> float:
         """Posição de estoque como o log a registra (sem propostas pendentes).
@@ -125,7 +148,9 @@ class SupplyChainSimulation:
         """
         self.P = params
         self.cfg = cfg
-        self.rng = np.random.default_rng(seed)   # gerador aleatório desta replicação
+        # gerador de números aleatórios desta replicação: TODOS os sorteios da
+        # simulação passam por ele, por isso a mesma semente repete o resultado
+        self.rng = np.random.default_rng(seed)
         self.H = float(horizon_days or params.horizon_days)
         self.ndays = int(math.ceil(self.H))
         self.include_exceptions = include_exceptions
@@ -141,7 +166,7 @@ class SupplyChainSimulation:
         # usado para continuar a tendência e o calendário no curto prazo
         self.t0 = float(cs["offset_days"]) if cs else 0.0
 
-        self.env = simpy.Environment()
+        self.env = simpy.Environment()   # o relógio e a agenda da simulação (começa em 0)
         self.ils = list(params.item_locations)
         self.il_index = {il: i for i, il in enumerate(self.ils)}
         n = len(self.ils)
@@ -167,7 +192,8 @@ class SupplyChainSimulation:
         self.so_variants = Counter()   # variantes do SalesOrderItem
         self.po_variants = Counter()   # variantes do PurchaseOrderItem
 
-        # --- armazenamento do OCEL simulado (só se record_ocel=True)
+        # --- armazenamento do OCEL simulado (só se record_ocel=True; guardar
+        #     cada evento ocupa memória, então isso é feito só quando pedido)
         self.events: list = []
         self.objects: dict = {}
         self._eid = 0
@@ -194,7 +220,8 @@ class SupplyChainSimulation:
         return self.rng.random() < p
 
     def new_oid(self, otype: str, prefix: str) -> str:
-        """Cria um id novo para um objeto simulado (ex.: POI-S000123)."""
+        """Cria um id novo para um objeto simulado (ex.: POI-S000123).
+        O "S" no id diferencia objetos simulados dos objetos do log original."""
         self._oid[otype] += 1
         self.obj_counts[otype] += 1
         return f"{prefix}-S{self._oid[otype]:06d}"
@@ -217,7 +244,10 @@ class SupplyChainSimulation:
 
     def emit(self, act: str, objs: dict, attrs: dict | None = None):
         """Registra UM evento com todos os objetos envolvidos (relações E2O).
-        ``objs`` = {id do objeto: qualificador}."""
+        ``objs`` = dicionário {id do objeto: qualificador}, ex.:
+        {"POI-S000012": "purchase order item", "SUP-001": "supplier", "IL-0043": ...}.
+        O contador de eventos por atividade é sempre atualizado; a lista completa
+        de eventos só é guardada quando o OCEL simulado foi pedido."""
         self.counts[act] += 1
         if self.record_ocel:
             self._eid += 1
@@ -349,15 +379,17 @@ class SupplyChainSimulation:
             if self.bern(st.p.p_order):
                 t = day + float(np.clip(tod.sample(self.rng, "empirical"), 0, 0.999))
                 if t > env.now:
-                    yield env.timeout(t - env.now)     # espera até a hora do pedido
+                    yield env.timeout(t - env.now)     # pausa este processo até a hora do pedido
                 if env.now >= self.H:
                     break
                 q = st.p.qty.sample(self.rng, self.mode)
                 q = max(1, int(round(q * self.demand_factor(env.now, st))))
+                # cria um NOVO processo só para este pedido de venda e segue em frente:
+                # o gerador de demanda não espera o pedido terminar
                 env.process(self.sales_order(st, float(q)))
             day += 1
             if day > env.now:
-                yield env.timeout(day - env.now)       # avança para o próximo dia
+                yield env.timeout(day - env.now)       # pausa até a meia-noite do próximo dia
 
     def sales_order(self, st: ILState, qty: float):
         """PROCESSO: ciclo de vida de um SalesOrderItem.
@@ -657,7 +689,9 @@ class SupplyChainSimulation:
         dist = P.supplier_lead_time.get(po.get("supplier"), P.supplier_lead_time["__all__"])
         age = po["age"]
         lt = None
-        for _ in range(200):  # amostragem por rejeição
+        # "amostragem por rejeição": sorteia lead times até sair um maior que a
+        # idade do pedido (no máximo 200 tentativas)
+        for _ in range(200):
             x = float(dist.sample(self.rng, self.mode))
             if x > age:
                 lt = x
@@ -683,7 +717,7 @@ class SupplyChainSimulation:
         """PROCESSO: no fim de cada dia (23:59) grava estoque, backorder e IP de cada IL."""
         env = self.env
         for dd in range(self.ndays):
-            t = dd + 0.99999
+            t = dd + 0.99999   # 23h59min59s do dia dd (o dia termina em dd + 1)
             if t > env.now:
                 yield env.timeout(t - env.now)
             for i, il in enumerate(self.ils):
@@ -698,9 +732,12 @@ class SupplyChainSimulation:
     def exceptions_process(self):
         """PROCESSO: eventos raros em toda a rede.
 
-        Os eventos chegam como um processo de Poisson com taxa total =
-        Σ taxas × nº de ILs (intervalos exponenciais). A cada chegada sorteia
-        qual exceção ocorre (proporcional à taxa) e em qual IL."""
+        Os eventos raros acontecem "ao acaso no tempo": não há horário fixo, e
+        um não influencia o outro. Esse padrão é o processo de Poisson; nele, o
+        tempo entre um evento e o próximo segue a distribuição exponencial.
+        A taxa total é a soma das taxas de cada exceção × nº de ILs (ex.: ~0,05
+        evento por dia na rede inteira). A cada chegada, sorteia qual exceção
+        ocorre (com probabilidade proporcional à taxa) e em qual IL."""
         env = self.env
         rates = self.P.exception_rates
         n = len(self.ils)

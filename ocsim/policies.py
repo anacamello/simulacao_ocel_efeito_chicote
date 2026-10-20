@@ -15,7 +15,9 @@ NOTAÇÃO
   L  = lead time total de reposição (proposta → recebimento, minerado do log)
   σ_L= desvio do lead time
   R  = intervalo de revisão (dias)
-  z  = Φ⁻¹(nível de serviço)  — ex.: 95% → z = 1,645
+  z  = fator de segurança = Φ⁻¹(nível de serviço), onde Φ⁻¹ é a inversa da
+       distribuição normal padrão: o nº de desvios-padrão de "folga" para
+       atender a demanda com a probabilidade desejada. Ex.: 95% → z = 1,645
   Q  = lote econômico (EOQ) arredondado ao lot_size do material
   F  = previsão da demanda diária (estática ou atualizada todo dia)
   IP = posição de estoque = em mão + em pedido + propostas pendentes − backorders
@@ -38,6 +40,13 @@ CENÁRIOS
 
 O desvio de proteção combina a incerteza da demanda e a do lead time:
         σ_T = √( T·σ² + F²·σ_L² )
+e o estoque de segurança é z·σ_T. T é o "período de proteção": o tempo que
+o estoque precisa aguentar até o próximo pedido chegar (L na revisão
+contínua; L + R na revisão periódica, pois o próximo pedido só sai daqui a R
+dias).
+
+Termos de programação (dataclass, dicionário...) estão no glossário de
+ocsim/__init__.py.
 """
 from __future__ import annotations
 
@@ -66,7 +75,7 @@ POLICY_SHORT = {"ATUAL": "Atual", "SQ": "(s,Q)", "RS": "(R,S)", "RSS": "(R,s,S)"
 # ===========================================================================
 # Configuração de um cenário (o que o usuário escolhe na etapa 4)
 # ===========================================================================
-@dataclass
+@dataclass  # "ficha" com as escolhas de um cenário
 class ScenarioConfig:
     policy: str = "RS"                  # código da política (ver POLICY_LABELS)
     name: str = ""                      # nome personalizado (opcional)
@@ -90,7 +99,9 @@ class ScenarioConfig:
         return self.name or POLICY_LABELS.get(self.policy, self.policy)
 
     def to_dict(self) -> dict:
-        """Converte em dicionário (necessário para enviar a processos paralelos)."""
+        """Converte a ficha em dicionário {campo: valor}.
+        Os processos paralelos recebem os dados como texto/bytes; um dicionário
+        simples é a forma mais segura de enviar o cenário para eles."""
         return asdict(self)
 
 
@@ -130,13 +141,15 @@ class PolicyState:
             a = cfg.es_alpha
             err = demand - self.forecast
             self.forecast = a * demand + (1 - a) * self.forecast
-            # desvio estimado pelo MAD (erro absoluto médio) suavizado: σ ≈ 1,25·MAD
+            # o desvio é estimado pelo MAD (média dos erros absolutos de previsão),
+            # também suavizado. Para a distribuição normal vale σ ≈ 1,25·MAD.
+            # Na 1ª vez ainda não existe _mad: começa a partir do desvio do log.
             mad = getattr(self, "_mad", self.sigma / 1.25)
             mad = a * abs(err) + (1 - a) * mad
             self._mad = mad
             self.sigma = max(1.25 * mad, 1e-6)
-        # 'estatico': mantém a média e o desvio estimados do log
-        self.recompute()
+        # 'estatico': não muda nada — usa sempre a média e o desvio do log
+        self.recompute()  # recalcula s e S com a previsão (possivelmente) nova
 
     def protection_sigma(self, horizon: float) -> float:
         """Desvio da demanda durante o período de proteção T:
@@ -202,6 +215,8 @@ def make_policy_state(il: ILParams, cfg: ScenarioConfig, lt_mean: float, lt_std:
     st = PolicyState(il=il, cfg=cfg, z=z, L=lt_mean, sigma_L=lt_std, Q=eoq(il, cfg, d), forecast=d, sigma=sd)
     if cfg.policy == "L4L":
         # base-stock = demanda durante (L+1) dias + estoque de segurança
+        # "base-stock" = nível-alvo fixo de estoque. Como ele não muda, repor até
+        # o nível todo dia equivale a pedir exatamente o que foi consumido no dia.
         st.S = d * (lt_mean + 1) + z * st.protection_sigma(lt_mean + 1)
         st.s = st.S
     elif cfg.policy == "ATUAL":

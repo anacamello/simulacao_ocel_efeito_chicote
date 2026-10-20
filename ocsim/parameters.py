@@ -21,6 +21,9 @@ produz um objeto ``ModelParameters`` com TUDO o que o simulador precisa:
 * calibração da política atual (mín–máx) e o estado no fim do log.
 
 O simulador (``simulation.py``) só lê este objeto — não consulta o log.
+
+Termos de programação (DataFrame, groupby, merge, unstack, reindex,
+dataclass...) estão explicados no glossário do arquivo ocsim/__init__.py.
 """
 from __future__ import annotations
 
@@ -37,9 +40,11 @@ from .distributions import Dist, bernoulli, fit_categorical, fit_discrete, fit_n
 ACT, TS, OID, OTYPE, EID = pm.ACT, pm.TS, pm.OID, pm.OTYPE, pm.EID
 
 # ---------------------------------------------------------------------------
-# Atributos cujo valor NÃO é sorteado: são calculados pelo estado da simulação
-# (ex.: o on_hand de um IL resulta das entradas e saídas simuladas).
-# Os demais atributos (ex.: carrier, priority) são sorteados das distribuições.
+# Atributos cujo valor NÃO é sorteado: eles resultam do que acontece na
+# simulação. Ex.: o estoque em mão (on_hand) de um IL é a soma das entradas
+# menos as saídas simuladas; o status de um pedido de compra muda para
+# "received" quando ele chega. Os demais atributos (ex.: carrier, priority)
+# não dependem do estado e são sorteados das distribuições do log.
 # ---------------------------------------------------------------------------
 STATE_ATTRIBUTES = {
     "ItemLocation": {"backorder", "inventory_position", "on_hand", "on_order", "reserved",
@@ -61,7 +66,7 @@ TIME_ATTRIBUTES = {"due_time", "planned_receipt_time", "actual_receipt_time", "c
 # ===========================================================================
 # Parâmetros de UM ItemLocation (combinação material × local)
 # ===========================================================================
-@dataclass
+@dataclass  # "ficha" com campos (ver glossário)
 class ILParams:
     il: str                    # id do ItemLocation (ex.: IL-0043)
     material: str              # material ligado (O2O)
@@ -91,7 +96,7 @@ class ILParams:
 # ===========================================================================
 # Conjunto completo de parâmetros do modelo
 # ===========================================================================
-@dataclass
+@dataclass  # "ficha" com todos os parâmetros que a simulação precisa
 class ModelParameters:
     start: pd.Timestamp                        # início do horizonte do log
     horizon_days: float                        # duração do log (dias)
@@ -112,6 +117,7 @@ class ModelParameters:
     cardinalities: pd.DataFrame                # tabela de cardinalidades O2O
     current_state: dict | None = None          # estado no fim do log (simulação de curto prazo)
     receipt_ratio: Dist | None = None          # quantidade recebida / pedida
+    # os dois campos abaixo começam, por padrão, com índice 1 em todos os dias (= sem efeito)
     calendar_dow: np.ndarray = field(default_factory=lambda: np.ones(7))   # índice por dia da semana
     calendar_dom: np.ndarray = field(default_factory=lambda: np.ones(31))  # índice por dia do mês
     notes: list[str] = field(default_factory=list)  # observações sobre os dados
@@ -149,10 +155,18 @@ def _pair(dur: pd.DataFrame, a: str, b: str) -> np.ndarray:
 
 # ---------------------------------------------------------------------------
 # Séries diárias (IL × dia) — usadas para a demanda e para medir o efeito
-# chicote do LOG REAL com a mesma métrica aplicada à simulação.
+# chicote do LOG ORIGINAL com a mesma métrica aplicada à simulação.
 # ---------------------------------------------------------------------------
 def daily_series(d: pm.OcelData, activity: str, qty_col: str = "quantity") -> pd.DataFrame:
-    """Soma diária de uma coluna de quantidade para uma atividade."""
+    """Soma diária de uma coluna de quantidade para uma atividade.
+
+    Resultado: uma matriz com uma linha por IL e uma coluna por dia
+    (dia 0 = primeiro dia do log). As funções seguintes seguem o mesmo roteiro:
+      1) seleciona os eventos de interesse;
+      2) calcula o nº do dia de cada evento (segundos desde o início ÷ 86 400);
+      3) groupby: soma as quantidades por (IL, dia);
+      4) unstack: gira os dias para colunas (matriz IL × dia);
+      5) reindex: garante todas as ILs e todos os dias, com 0 onde não houve evento."""
     e = d.events[d.events[ACT] == activity]
     day = ((e[TS] - d.start).dt.total_seconds() // 86400).astype(int)
     s = e.assign(day=day).groupby(["il", "day"])[qty_col].sum().unstack(fill_value=0.0)
@@ -163,7 +177,10 @@ def daily_series(d: pm.OcelData, activity: str, qty_col: str = "quantity") -> pd
 
 def requested_quantity_series(d: pm.OcelData) -> pd.DataFrame:
     """DEMANDA DO CLIENTE FINAL: requested_quantity dos SalesOrderItem,
-    somada por IL e por dia de criação. Linhas = ILs, colunas = dias."""
+    somada por IL e por dia de criação. Linhas = ILs, colunas = dias.
+
+    A quantidade pedida é um atributo do OBJETO SalesOrderItem e o IL vem do
+    EVENTO de criação; por isso juntamos (merge) as duas informações."""
     rel = d.relations[(d.relations[OTYPE] == "SalesOrderItem") & (d.relations[ACT] == "Sales Order Item Created")]
     so = rel[[EID, OID, TS]].merge(d.events[[EID, "il"]], on=EID)
     attrs = d.objects.set_index(OID)["requested_quantity"]
@@ -195,20 +212,27 @@ def net_stock_series(d: pm.OcelData) -> pd.DataFrame:
     e["ns"] = e["on_hand_after"].astype(float) - e["backorder_after"].astype(float)
     s = e.groupby(["il", "day"])["ns"].last().unstack()
     days = np.arange(int(math.ceil(d.horizon_days)))
-    return s.reindex(columns=days).ffill(axis=1).bfill(axis=1)  # dias sem evento repetem o último valor
+    # dias sem nenhum evento não têm valor: ffill repete o último valor conhecido
+    # (o estoque não muda se nada acontece); bfill preenche os primeiros dias
+    return s.reindex(columns=days).ffill(axis=1).bfill(axis=1)
 
 
 def _trend_season(series: np.ndarray, start: pd.Timestamp) -> tuple[float, np.ndarray]:
     """Estima TENDÊNCIA e SAZONALIDADE de uma série diária de demanda.
 
     1) agrega a série por mês (média diária de cada mês);
-    2) ajusta uma reta y = a + b·t; a tendência só é mantida se for
-       estatisticamente significativa (|b / erro-padrão| > 2);
+    2) ajusta uma reta y = a + b·t (regressão linear: a = intercepto, b =
+       inclinação, ou seja, quanto a demanda cresce por dia). A tendência só é
+       mantida se for estatisticamente significativa: a inclinação precisa ser
+       mais de 2 vezes maior que o seu erro-padrão (equivale a um teste t com
+       ~95% de confiança);
     3) divide a série pela reta e calcula a razão média de cada mês do ano
-       → índice sazonal (12 valores com média 1);
+       → índice sazonal (12 valores com média 1; ex.: 1,10 em dezembro =
+       demanda 10% acima do normal);
     4) a sazonalidade só é mantida se a diferença entre o maior e o menor
-       índice for > 10%.
-    Retorna (tendência relativa por dia, índice sazonal)."""
+       índice for > 10%; abaixo disso é considerada ruído.
+    Retorna (tendência relativa por dia, índice sazonal).
+    Ex.: tendência 0,001 = demanda cresce 0,1% da média por dia (≈ 37% ao ano)."""
     n = len(series)
     if series.sum() <= 0 or n < 60:
         return 0.0, np.ones(12)
@@ -220,10 +244,11 @@ def _trend_season(series: np.ndarray, start: pd.Timestamp) -> tuple[float, np.nd
     mean = y.mean()
     if mean <= 0:
         return 0.0, np.ones(12)
-    b, a = np.polyfit(t, y, 1)  # regressão linear (inclinação b, intercepto a)
-    resid = y - (a + b * t)
+    b, a = np.polyfit(t, y, 1)  # ajusta a reta: devolve inclinação b e intercepto a
+    resid = y - (a + b * t)     # resíduos = diferença entre os dados e a reta
+    # erro-padrão da inclinação (fórmula clássica da regressão linear simples)
     se = math.sqrt(max(np.sum(resid ** 2) / max(len(y) - 2, 1), 1e-12) / max(np.sum((t - t.mean()) ** 2), 1e-12))
-    trend = b / mean if abs(b / se) > 2 else 0.0  # teste t simples
+    trend = b / mean if abs(b / se) > 2 else 0.0  # mantém só se |b / erro| > 2
     fitted = mean * (1 + trend * (t - t.mean()))
     ratio = pd.Series(np.where(fitted > 0, y / fitted, 1.0), index=monthly.index)
     idx = ratio.groupby(ratio.index.month).mean().reindex(range(1, 13)).fillna(1.0).to_numpy()
@@ -238,9 +263,10 @@ def _trend_season(series: np.ndarray, start: pd.Timestamp) -> tuple[float, np.nd
 # ===========================================================================
 def extract_parameters(d: pm.OcelData, progress=None) -> ModelParameters:
     """Percorre o OCEL e devolve todos os parâmetros da simulação.
-    ``progress`` (opcional) recebe mensagens de andamento para a interface."""
+    ``progress`` (opcional) é uma função que recebe mensagens de andamento;
+    a interface e o run_experiment.py a usam para mostrar em que passo estamos."""
 
-    def step(msg):
+    def step(msg):  # envia a mensagem de andamento, se alguém pediu para recebê-la
         if progress:
             progress(msg)
 
@@ -260,7 +286,11 @@ def extract_parameters(d: pm.OcelData, progress=None) -> ModelParameters:
 
     def add_delay(key, otype, a, b, x=None, seed=0):
         """Ajusta a distribuição do tempo entre as atividades a → b no log
-        achatado de ``otype`` e guarda com o nome ``key``."""
+        achatado de ``otype`` e guarda com o nome ``key``.
+        Ex.: add_delay("rp_created_to_approved", "ReplenishmentProposal",
+        "Replenishment Proposal Created", "Replenishment Proposal Approved")
+        guarda em delays["rp_created_to_approved"] a distribuição do tempo de
+        aprovação das propostas. O simulador depois sorteia desse nome."""
         if x is None:
             x = _pair(durs[otype], a, b)
         delays[key] = fit_numeric(x, seed=seed)
@@ -303,7 +333,9 @@ def extract_parameters(d: pm.OcelData, progress=None) -> ModelParameters:
     step("Calculando lead time por fornecedor…")
     rel = d.relations
     fl = flats[P]
-    first = fl.groupby(["case", "act"])["ts"].min().unstack()   # 1ª ocorrência de cada atividade por PO
+    # tabela com uma linha por pedido de compra e uma coluna por atividade,
+    # contendo a data/hora da 1ª vez que a atividade ocorreu naquele pedido
+    first = fl.groupby(["case", "act"])["ts"].min().unstack()
     lt = _days(first.get("Goods Receipt") - first.get("Purchase Order Item Created")).dropna()
     lt = lt[lt >= 0]
     o2o = d.o2o
@@ -449,7 +481,8 @@ def extract_parameters(d: pm.OcelData, progress=None) -> ModelParameters:
     init = ev[ev[ACT] == "Initialize Inventory"].groupby("il")["on_hand_after"].first()
     so_rel = rel[(rel[OTYPE] == S) & (rel[ACT] == "Sales Order Item Created")][[EID, OID]].merge(ev[[EID, "il"]], on=EID)
     so_q = so_rel.assign(q=so_rel[OID].map(d.objects.set_index(OID)["requested_quantity"]).astype(float))
-    sup_counts = pd.crosstab(po_il, po_sup)      # nº de POs por (IL, fornecedor)
+    # tabela cruzada (como uma tabela dinâmica): nº de POs por IL (linha) e fornecedor (coluna)
+    sup_counts = pd.crosstab(po_il, po_sup)
     rp_mean = delays["rp_created_to_approved"].mean
     ap_mean = delays["rp_approved_to_po"].mean
 
@@ -516,6 +549,7 @@ def extract_parameters(d: pm.OcelData, progress=None) -> ModelParameters:
     #     por dia da semana e por dia do mês (ex.: segundas +15%, sextas −19%)
     # -----------------------------------------------------------------------
     tot = pd.Series(dem.sum(axis=0).to_numpy(), index=pd.date_range(d.start, periods=dem.shape[1], freq="D"))
+    # média móvel centrada de 28 dias = "nível normal" da demanda em torno de cada dia
     base = tot.rolling(28, center=True, min_periods=7).mean()
     ratio = (tot / base).iloc[14:]
     dow = ratio.groupby(ratio.index.dayofweek).mean().reindex(range(7)).fillna(1).to_numpy()
@@ -571,10 +605,11 @@ def _asis_review_probability(d: pm.OcelData) -> float:
     Created'. A fração de dias "abaixo de s" com proposta é a probabilidade
     (≈ 0,18 neste log)."""
     e = d.events.dropna(subset=["il"]).copy()
-    e["day"] = e[TS].dt.normalize()
-    before = e[e[TS].dt.hour < 17]
+    e["day"] = e[TS].dt.normalize()          # data sem a hora
+    before = e[e[TS].dt.hour < 17]           # eventos antes da revisão das 17h
+    # último valor da posição de estoque e do limite s antes da revisão, por IL e dia
     ip = before.groupby(["il", "day"])[["inventory_position_after", "lower_threshold"]].last()
-    ip = ip.groupby(level=0).ffill()
+    ip = ip.groupby(level=0).ffill()         # dias sem evento herdam o último valor do mesmo IL
     rp = set(map(tuple, e.loc[e[ACT] == "Replenishment Proposal Created", ["il", "day"]].to_numpy()))
     low = ip[ip["inventory_position_after"] <= ip["lower_threshold"]]
     if len(low) == 0:
@@ -593,6 +628,7 @@ def current_state(d: pm.OcelData, po_sup: pd.Series, po_il: pd.Series) -> dict:
       (com idade ≤ 150 dias; mais antigos são considerados perdidos)."""
     e = d.events.dropna(subset=["il"]).sort_values(TS)
     cols = ["on_hand_after", "backorder_after", "on_order_after", "upper_threshold", "lower_threshold"]
+    # último valor registrado (não vazio) de cada coluna, para cada IL
     last = e.groupby("il")[cols].agg(lambda x: x.dropna().iloc[-1] if x.notna().any() else np.nan)
     rel = d.relations[d.relations[OTYPE] == "PurchaseOrderItem"]
     acts = rel.groupby(OID)[ACT].agg(set)              # atividades já ocorridas em cada PO

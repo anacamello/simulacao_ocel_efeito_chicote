@@ -6,7 +6,7 @@ PAPEL NO PROJETO
 ----------------
 Centraliza o visual dos gráficos para que todos sigam o mesmo padrão:
 * cada cenário tem SEMPRE a mesma cor (paleta fixa, testada para daltonismo);
-* o log real aparece sempre em cinza escuro;
+* o log original aparece sempre em cinza escuro;
 * grade discreta, fundo transparente, legenda no topo.
 """
 from __future__ import annotations
@@ -20,7 +20,7 @@ import plotly.graph_objects as go
 # ---------------------------------------------------------------------------
 SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#6250d6", "#e34948"]
 POLICY_COLOR = {"ATUAL": SERIES[0], "SQ": SERIES[1], "RS": SERIES[2], "RSS": SERIES[3], "L4L": SERIES[4]}
-LOG_COLOR = "#52514e"   # log real (referência)
+LOG_COLOR = "#52514e"   # log original (referência)
 MUTED = "#8a8984"       # linhas auxiliares (BWE = 1, barras de erro)
 GRID = "#e6e5e0"        # grade
 TEXT = "#0b0b0b"        # textos e rótulos
@@ -66,9 +66,9 @@ def hist_with_fit(samples: np.ndarray, dist, title: str, xtitle: str, bins: int 
 
 
 def bar_ci(df: pd.DataFrame, value: str, lo: str, hi: str, cat: str, policies: list[str], title: str,
-           ytitle: str, ref: float | None = None, ref_label: str = "log real") -> go.Figure:
+           ytitle: str, ref: float | None = None, ref_label: str = "log original") -> go.Figure:
     """Barras por cenário com a média, barra de erro do IC 95% e (opcional) a
-    linha tracejada do valor medido no log real. Para gráficos de BWE também
+    linha tracejada do valor medido no log original. Para gráficos de BWE também
     desenha a linha pontilhada BWE = 1 (sem amplificação).
 
     df: uma linha por cenário com as colunas ``cat`` (nome), ``value`` (média),

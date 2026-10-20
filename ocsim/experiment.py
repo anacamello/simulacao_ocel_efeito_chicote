@@ -8,7 +8,7 @@ Liga as peças: para cada cenário e cada replicação roda a simulação
 (``simulation.py``), calcula as métricas (``metrics.py``) e junta os
 resultados. Também:
 
-* calcula as MESMAS métricas direto no log real (linha de base / referência);
+* calcula as MESMAS métricas direto no log original (linha de base / referência);
 * monta a tabela de validação (cenário Atual × log), como na avaliação do OCPS;
 * calcula médias e intervalos de confiança de 95% entre replicações;
 * exporta o log simulado em OCEL 2.0 (mesmo formato do arquivo original).
@@ -27,7 +27,10 @@ from __future__ import annotations
 import json
 import math
 import os
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing as mp
+import sys
+import time
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
 
 import numpy as np
 import pandas as pd
@@ -38,13 +41,20 @@ from .parameters import (ModelParameters, TIME_ATTRIBUTES, requested_quantity_se
 from .policies import ScenarioConfig
 from .simulation import SupplyChainSimulation
 
-# Na execução paralela cada processo recebe os parâmetros UMA vez (ao iniciar)
-# e os guarda nesta variável global, em vez de recebê-los a cada replicação.
+# EXECUÇÃO PARALELA — ideia geral
+# Para ganhar tempo, as replicações podem rodar ao mesmo tempo em vários
+# núcleos do processador. Cada núcleo roda uma cópia separada do Python (um
+# "processo auxiliar"), que não enxerga as variáveis do programa principal.
+# Por isso os parâmetros do modelo (ModelParameters) precisam ser ENVIADOS a
+# cada processo auxiliar. Para não reenviá-los a cada replicação, cada
+# processo os recebe UMA vez, ao iniciar, e os guarda na variável abaixo.
+# ("global" = variável do arquivo inteiro, visível por todas as funções dele.)
 _PARAMS: ModelParameters | None = None
 
 
 def _init_worker(params):
-    """Executada uma vez em cada processo paralelo."""
+    """Executada uma única vez em cada processo auxiliar, quando ele começa:
+    guarda os parâmetros recebidos na variável _PARAMS daquele processo."""
     global _PARAMS
     _PARAMS = params
 
@@ -120,35 +130,130 @@ def run_replication(cfg_dict: dict, seed: int, rep: int, opts: dict, params: Mod
 # ===========================================================================
 # TODAS as replicações de TODOS os cenários
 # ===========================================================================
+def parallel_supported() -> bool:
+    """Indica se a execução paralela deve vir LIGADA por padrão neste computador.
+
+    O modo de criar os processos auxiliares depende do sistema operacional
+    (ver "Processos paralelos" no glossário de __init__.py):
+      • Linux ("fork"): cada processo auxiliar nasce como clone do programa já
+        em execução — rápido e confiável;
+      • Windows e macOS ("spawn"): cada processo auxiliar é um Python novo que
+        carrega tudo do zero. Dentro do Streamlit isso já causou travamentos.
+    Por isso a interface deixa a opção ligada só no Linux. Nos outros sistemas
+    o usuário pode ligá-la; se travar, o programa volta sozinho ao modo de um
+    núcleo (ver run_experiment)."""
+    return sys.platform.startswith("linux")
+
+
+def _kill_pool(ex: ProcessPoolExecutor):
+    """Encerra à força todos os processos auxiliares de um grupo ("pool")
+    que travou, para que não fiquem rodando esquecidos no computador."""
+    for p in list(getattr(ex, "_processes", {}).values()):
+        try:
+            p.terminate()
+        except Exception:
+            pass
+    try:
+        ex.shutdown(wait=False, cancel_futures=True)
+    except Exception:
+        pass
+
+
+class _HideMainModule:
+    """Impede que os processos auxiliares executem o app.py de novo
+    (esta é a correção do travamento no Windows/macOS).
+
+    O problema: no modo "spawn" (Windows/macOS), cada processo auxiliar é um
+    Python novo. Antes de trabalhar, ele carrega de novo o "arquivo principal"
+    do programa — o que o Python chama de módulo ``__main__``. Quando o
+    programa roda dentro do Streamlit, o arquivo principal é o próprio app.py.
+    Resultado: cada processo auxiliar tentava abrir a interface inteira de novo
+    (ler o OCEL, desenhar a tela...) em vez de simular, e a barra de progresso
+    ficava parada em "Iniciando…".
+
+    A solução: durante os poucos instantes em que os processos auxiliares são
+    criados, trocamos o "arquivo principal" por um módulo vazio. Assim eles
+    carregam apenas o que precisam (este arquivo, com a função
+    run_replication) e o app.py fica intocado. Logo depois, o original é
+    devolvido.
+
+    Uso:  with _HideMainModule():
+              ...cria os processos...       ← aqui o app.py fica "escondido"
+    """
+
+    def __enter__(self):   # executado ao entrar no bloco "with": esconde o app
+        import types
+        self._orig = sys.modules.get("__main__")
+        sys.modules["__main__"] = types.ModuleType("__main__")
+        return self
+
+    def __exit__(self, *exc):   # executado ao sair do bloco "with": devolve o original
+        if self._orig is not None:
+            sys.modules["__main__"] = self._orig
+        return False
+
+
 def run_experiment(params: ModelParameters, scenarios: list[ScenarioConfig], n_reps: int, base_seed: int = 42,
-                   opts: dict | None = None, progress=None, parallel: bool = True, max_workers: int | None = None):
+                   opts: dict | None = None, progress=None, parallel: bool = True, max_workers: int | None = None,
+                   stall_timeout: float = 90.0):
     """Executa n_reps replicações de cada cenário.
 
     Se ``parallel`` for True, distribui as replicações entre os núcleos do
-    processador (até 8). Se o paralelismo falhar (comum em alguns ambientes
-    Windows), roda tudo em sequência automaticamente.
+    processador (até 8). Se o paralelismo falhar OU TRAVAR (nenhuma replicação
+    concluída em ``stall_timeout`` segundos — situação possível no Windows/macOS
+    dentro do Streamlit), os processos são encerrados e tudo roda em sequência,
+    automaticamente.
     ``progress(fração, mensagem)`` atualiza a barra de progresso da interface."""
     opts = opts or {}
-    # lista de tarefas: (cenário, semente, nº da replicação) — números aleatórios comuns
+    # Lista de tarefas, uma por (cenário, replicação). A semente da replicação r
+    # é base_seed + r em TODOS os cenários (números aleatórios comuns).
+    # Ex.: 5 cenários × 10 replicações = 50 tarefas.
     tasks = [(sc.to_dict(), base_seed + r, r) for sc in scenarios for r in range(n_reps)]
     out = []
     total = len(tasks)
     if parallel and total > 1:
+        # nº de processos auxiliares = nº de núcleos do computador (no máximo 8)
         workers = max_workers or max(1, min(os.cpu_count() or 1, total, 8))
+        if progress:
+            progress(0.0, f"Iniciando {workers} processos paralelos…")
+        ex = None
         try:
-            with ProcessPoolExecutor(max_workers=workers, initializer=_init_worker, initargs=(params,)) as ex:
-                futs = [ex.submit(run_replication, c, s, r, opts) for c, s, r in tasks]
-                for i, f in enumerate(as_completed(futs)):   # à medida que terminam
+            # modo de criação dos processos: "fork" no Linux, "spawn" nos demais
+            ctx = mp.get_context("fork") if sys.platform.startswith("linux") else mp.get_context("spawn")
+            # ProcessPoolExecutor = um "pool" (grupo) de processos auxiliares que
+            # pegam tarefas de uma fila; cada um começa executando _init_worker(params)
+            ex = ProcessPoolExecutor(max_workers=workers, mp_context=ctx,
+                                     initializer=_init_worker, initargs=(params,))
+            # submit = coloca uma tarefa na fila do pool. Os processos auxiliares
+            # são criados nesse momento, por isso o app fica "escondido" aqui.
+            # Cada submit devolve um "recibo" (future) que depois dá o resultado.
+            with _HideMainModule():
+                pending = {ex.submit(run_replication, c, s, r, opts) for c, s, r in tasks}
+            while pending:
+                # espera até QUALQUER replicação terminar (no máximo stall_timeout
+                # segundos). done = recibos prontos; pending = os que faltam.
+                # Se nenhuma terminar nesse prazo, consideramos que travou.
+                done, pending = wait(pending, timeout=stall_timeout, return_when=FIRST_COMPLETED)
+                if not done:
+                    raise TimeoutError(f"nenhuma replicação concluída em {stall_timeout:.0f} s")
+                for f in done:
                     out.append(f.result())
-                    if progress:
-                        progress((i + 1) / total, f"{i + 1}/{total} replicações concluídas")
+                if progress:
+                    progress(len(out) / total, f"{len(out)}/{total} replicações concluídas")
+            ex.shutdown(wait=True)
             return _sort(out, scenarios)
         except Exception as e:
+            # qualquer problema (erro ou travamento): encerra os processos auxiliares
+            # e segue para o modo de um núcleo, logo abaixo
+            if ex is not None:
+                _kill_pool(ex)
             if progress:
-                progress(0.0, f"Execução paralela indisponível ({type(e).__name__}); rodando em sequência…")
+                progress(0.0, f"Execução paralela indisponível ({type(e).__name__}: {e}); rodando em sequência…")
             out = []
-    # execução sequencial
+    # execução sequencial (um núcleo)
     for i, (c, s, r) in enumerate(tasks):
+        if progress and i == 0:
+            progress(0.0, f"0/{total} replicações concluídas")
         out.append(run_replication(c, s, r, opts, params=params))
         if progress:
             progress((i + 1) / total, f"{i + 1}/{total} replicações concluídas")
@@ -165,8 +270,13 @@ def _sort(out, scenarios):
 # Agregação estatística
 # ===========================================================================
 def ci95(x) -> tuple[float, float, float]:
-    """Média e intervalo de confiança de 95% (t de Student):
-    média ± t(0,975; n−1) · s / √n.  Retorna (média, limite inferior, limite superior)."""
+    """Média e intervalo de confiança de 95% entre as replicações.
+
+    Fórmula: média ± t · s / √n, onde n = nº de replicações, s = desvio-padrão
+    entre elas e t = valor da distribuição t de Student (para n = 10, t ≈ 2,26).
+    Interpretação: com 95% de confiança, a média "verdadeira" do cenário está
+    dentro do intervalo. Mais replicações → intervalo mais estreito.
+    Retorna (média, limite inferior, limite superior)."""
     x = np.asarray([v for v in x if v is not None and np.isfinite(v)], dtype=float)
     if len(x) == 0:
         return np.nan, np.nan, np.nan
@@ -204,11 +314,11 @@ def summary_table(df: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
 
 
 # ===========================================================================
-# Linha de base: métricas calculadas sobre o LOG REAL
+# Linha de base: métricas calculadas sobre o LOG ORIGINAL
 # ===========================================================================
 def log_baseline(d, params: ModelParameters, warmup_days: int = 56, bucket_days: int = 7) -> dict:
     """Aplica ao OCEL original exatamente as mesmas medidas da simulação,
-    para que real e simulado sejam comparáveis."""
+    para que original e simulado sejam comparáveis."""
     # séries diárias do log: demanda, pedidos e estoque líquido
     dem = requested_quantity_series(d)
     orders = ordered_quantity_series(d)
@@ -293,7 +403,7 @@ def _val(name, v, base):
 
 
 def to_ocel_json(sim: SupplyChainSimulation, params: ModelParameters) -> str:
-    """Gera o OCEL 2.0 (JSON) da simulação no mesmo esquema do arquivo de entrada:
+    """Gera o OCEL 2.0 (arquivo de texto no formato JSON) da simulação, com a mesma estrutura do arquivo de entrada:
     eventTypes, objectTypes, events (com relationships E2O) e objects (com
     atributos datados e relationships O2O). Pode ser lido pelo PM4Py/OCPM."""
     # no curto prazo o relógio começa no fim do log
