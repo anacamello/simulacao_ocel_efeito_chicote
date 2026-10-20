@@ -1,0 +1,79 @@
+digraph G {
+  graph [rankdir=TB, splines=spline, nodesep=0.45, ranksep=0.42, pad=0.3, bgcolor="white",
+         fontname="Helvetica", fontsize=13, newrank=true];
+  node  [shape=plain, fontname="Helvetica"];
+  edge  [color="#52514e", penwidth=1.4, arrowsize=0.8, fontname="Helvetica", fontsize=10.5, fontcolor="#52514e"];
+
+  ocel [label=<<table border="1" cellborder="0" cellpadding="7" bgcolor="#f1f0ec" color="#8a8984" style="rounded">
+    <tr><td><font point-size="14"><b>Arquivo OCEL 2.0 (JSON)</b></font></td></tr>
+    <tr><td><font point-size="11" color="#52514e">enviado pelo usuário · eventos, objetos, relações E2O e O2O</font></td></tr></table>>];
+
+  subgraph cluster_1 {
+    label=<<b>1 · Leitura e mineração de processos</b>>; labeljust=l; style="rounded,filled"; fillcolor="#eef4fc"; color="#2a78d6"; fontcolor="#1f5aa3"; margin=14;
+    spacer1 [shape=box, style=invis, width=3.6, height=0.2, label=""];
+    pm [label=<<table border="1" cellborder="0" cellpadding="6" bgcolor="white" color="#2a78d6" style="rounded">
+      <tr><td align="left"><font point-size="14"><b>process_mining.py</b></font>   <font point-size="11" color="#2a78d6"><b>PM4Py</b></font></td></tr>
+      <tr><td align="left"><font point-size="11">• leitura do OCEL (read_ocel2_json) → tabelas pandas<br align="left"/>• modelo de objetos: tipos, atributos, cardinalidades O2O/E2O<br align="left"/>• OC-DFG e Petri net centrada em objetos<br align="left"/>• achatamento por tipo de objeto: variantes, DFG de desempenho<br align="left"/>• diagnóstico do achatamento (deficiência, convergência, divergência)<br align="left"/></font></td></tr></table>>];
+  }
+
+  {rank=same; spacer1; pm}
+  spacer1 -> pm [style=invis];
+  subgraph cluster_2 {
+    label=<<b>2 · Parâmetros e distribuições</b>>; labeljust=l; style="rounded,filled"; fillcolor="#fdf0ea"; color="#eb6834"; fontcolor="#b4481c"; margin=14;
+    par [label=<<table border="1" cellborder="0" cellpadding="6" bgcolor="white" color="#eb6834" style="rounded">
+      <tr><td align="left"><font point-size="14"><b>parameters.py</b></font></td></tr>
+      <tr><td align="left"><font point-size="11">• durações entre atividades por tipo de objeto<br align="left"/>• lead time por fornecedor, recebimento parcial<br align="left"/>• demanda por ItemLocation (tendência, sazonalidade, calendário)<br align="left"/>• atributos, nº de ocorrências de atividades, tempo de vida<br align="left"/>• probabilidades de roteamento, exceções, estado no fim do log<br align="left"/></font></td></tr></table>>];
+    dist [label=<<table border="1" cellborder="0" cellpadding="6" bgcolor="white" color="#eb6834" style="rounded">
+      <tr><td align="left"><font point-size="14"><b>distributions.py</b></font>   <font point-size="11" color="#b4481c"><b>SciPy</b></font></td></tr>
+      <tr><td align="left"><font point-size="11">• ajuste por máxima verossimilhança<br align="left"/>• escolha pelo menor AIC + teste KS<br align="left"/>• empírica quando n &lt; 15<br align="left"/>• categóricas e discretas<br align="left"/></font></td></tr></table>>];
+    {rank=same; par; dist}
+  }
+
+  subgraph cluster_3 {
+    label=<<b>3 · Cenários e simulação</b>>; labeljust=l; style="rounded,filled"; fillcolor="#e9f7f1"; color="#1baf7a"; fontcolor="#11795a"; margin=14;
+    pol [label=<<table border="1" cellborder="0" cellpadding="6" bgcolor="white" color="#1baf7a" style="rounded">
+      <tr><td align="left"><font point-size="14"><b>policies.py</b></font></td></tr>
+      <tr><td align="left"><font point-size="11">• Atual (mín–máx do log)<br align="left"/>• (s, Q) · (R, S) · (R, s, S) · Lote a lote<br align="left"/>• previsão estática / média móvel / suav. exponencial<br align="left"/>• EOQ, estoque de segurança, nível de serviço<br align="left"/></font></td></tr></table>>];
+    sim [label=<<table border="1" cellborder="0" cellpadding="6" bgcolor="white" color="#1baf7a" style="rounded">
+      <tr><td align="left"><font point-size="14"><b>simulation.py</b></font>   <font point-size="11" color="#11795a"><b>SimPy</b></font></td></tr>
+      <tr><td align="left"><font point-size="11">• simulação de eventos discretos centrada em objetos (OCPS)<br align="left"/>• processos por tipo: SalesOrderItem, ReplenishmentProposal,<br align="left"/>   PurchaseOrderItem, Delivery, TransferOrder<br align="left"/>• eventos compartilhados com relações E2O<br align="left"/>• séries diárias por IL e OCEL simulado<br align="left"/></font></td></tr></table>>];
+    exp [label=<<table border="1" cellborder="0" cellpadding="6" bgcolor="white" color="#1baf7a" style="rounded">
+      <tr><td align="left"><font point-size="14"><b>experiment.py</b></font></td></tr>
+      <tr><td align="left"><font point-size="11">• N replicações por cenário (números aleatórios comuns)<br align="left"/>• execução paralela · médias e IC 95%<br align="left"/>• exportação do OCEL simulado (OCEL 2.0)<br align="left"/></font></td></tr></table>>];
+    {rank=same; pol; sim}
+  }
+
+  subgraph cluster_4 {
+    label=<<b>4 · Análise dos resultados</b>>; labeljust=l; style="rounded,filled"; fillcolor="#fdf6e6"; color="#eda100"; fontcolor="#9a6a00"; margin=14;
+    met [label=<<table border="1" cellborder="0" cellpadding="6" bgcolor="white" color="#eda100" style="rounded">
+      <tr><td align="left"><font point-size="14"><b>metrics.py</b></font></td></tr>
+      <tr><td align="left"><font point-size="11">• efeito chicote: BWE = Var(pedidos) / Var(demanda)<br align="left"/>   por IL, Location, fornecedor e rede · NSAmp<br align="left"/>• fill rate, backorders, estoque, custos<br align="left"/></font></td></tr></table>>];
+    val [label=<<table border="1" cellborder="0" cellpadding="6" bgcolor="white" color="#eda100" style="rounded">
+      <tr><td align="left"><font point-size="14"><b>validação</b></font>   <font point-size="11" color="#9a6a00">experiment.py · PM4Py</font></td></tr>
+      <tr><td align="left"><font point-size="11">• cenário Atual × log original<br align="left"/>• visão unificada: OCEL simulado<br align="left"/>   minerado como o original<br align="left"/></font></td></tr></table>>];
+    imp [label=<<table border="1" cellborder="0" cellpadding="6" bgcolor="white" color="#eda100" style="rounded">
+      <tr><td align="left"><font point-size="14"><b>impact.py</b></font></td></tr>
+      <tr><td align="left"><font point-size="11">• fornecedor → cliente<br align="left"/>• reposição → falta de estoque<br align="left"/>• demanda → pedidos (defasagem)<br align="left"/>• lead time → efeito chicote<br align="left"/></font></td></tr></table>>];
+    {rank=same; met; val; imp}
+  }
+
+  subgraph cluster_5 {
+    label=<<b>5 · Apresentação</b>>; labeljust=l; style="rounded,filled"; fillcolor="#f4f3f0"; color="#8a8984"; fontcolor="#52514e"; margin=14;
+    app [label=<<table border="1" cellborder="0" cellpadding="6" bgcolor="white" color="#52514e" style="rounded">
+      <tr><td align="left"><font point-size="14"><b>app.py</b></font>   <font point-size="11" color="#52514e"><b>Streamlit · Plotly (ui_charts.py)</b></font></td></tr>
+      <tr><td align="left"><font point-size="11">• etapas 0 a 10 · comparação de cenários · número de replicações escolhido pelo usuário<br align="left"/>• exportação de CSVs e do OCEL simulado   (alternativa sem interface: run_experiment.py)<br align="left"/></font></td></tr></table>>];
+  }
+
+  ocel -> pm  [label="  arquivo JSON"];
+  pm   -> par [label="  OcelData + logs achatados"];
+  par  -> dist [dir=both, arrowtail=normal, label=" observações /\n distribuições ", constraint=false];
+  par  -> pol [label="  ModelParameters"];
+  par  -> sim [label="  ModelParameters"];
+  pol  -> sim [label=" regra de\n reposição ", constraint=false];
+  sim  -> exp [label="  séries diárias e OCEL simulado"];
+  exp  -> met;
+  exp  -> val;
+  exp  -> imp;
+  pm   -> val [style=dashed, color="#2a78d6", fontcolor="#2a78d6", label=" log original ", constraint=false];
+  met  -> app; val -> app; imp -> app;
+}
