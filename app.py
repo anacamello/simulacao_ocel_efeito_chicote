@@ -7,21 +7,35 @@ Executar:  streamlit run app.py
 PAPEL NO PROJETO
 ----------------
 É a "vitrine" do trabalho. NÃO faz cálculos próprios: chama os módulos do
-pacote ``ocsim`` e mostra os resultados em 10 páginas (etapas 0 a 9), na
+pacote ``ocsim`` e mostra os resultados em 11 páginas (etapas 0 a 10), na
 ordem do método:
 
   0 Visão geral → 1 Dados OCEL → 2 Mineração → 3 Distribuições → 4 Cenários →
-  5 Simulação → 6 Validação → 7 Visão unificada → 8 Comparação → 9 Exportar
+  5 Simulação → 6 Validação → 7 Visão unificada → 8 Comparação →
+  9 Impacto entre objetos → 10 Exportar
 
 COMO O STREAMLIT FUNCIONA (resumo)
 -----------------------------------
-* O script inteiro é executado de cima para baixo A CADA interação do usuário
-  (clique, troca de opção...).
-* Para não refazer cálculos pesados a cada clique usamos CACHE:
-  ``@st.cache_resource`` / ``@st.cache_data`` guardam o resultado de uma
-  função para os mesmos argumentos.
-* ``st.session_state`` é um dicionário que sobrevive entre execuções; nele
-  guardamos os cenários escolhidos e os resultados da simulação.
+O Streamlit transforma um arquivo Python numa página web: cada comando
+``st.algumacoisa`` desenha um elemento na tela (``st.title`` = título,
+``st.dataframe`` = tabela, ``st.button`` = botão, ``st.plotly_chart`` = gráfico).
+
+* O arquivo inteiro é executado de cima para baixo A CADA interação do usuário
+  (clique, troca de opção...). É como se a página fosse redesenhada do zero.
+* Por isso, cálculos pesados (ler o OCEL de 60 MB, ajustar distribuições)
+  usam CACHE (ver glossário em ocsim/__init__.py). As linhas
+  ``@st.cache_resource`` e ``@st.cache_data`` colocadas logo acima de uma
+  função dizem ao Streamlit: "guarde o resultado; se a função for chamada de
+  novo com os mesmos valores, devolva o resultado guardado em vez de
+  recalcular".
+* Como tudo é reexecutado a cada clique, as variáveis comuns "esquecem" seus
+  valores. Para lembrar algo entre cliques (os cenários escolhidos, os
+  resultados da simulação) usamos ``st.session_state``, um dicionário que o
+  Streamlit mantém enquanto a aba do navegador estiver aberta.
+* ``st.stop()`` interrompe a execução naquele ponto (o resto da página não é
+  desenhado). É usado, por exemplo, enquanto nenhum arquivo foi enviado.
+
+Termos de programação estão no glossário de ocsim/__init__.py.
 """
 from __future__ import annotations
 
@@ -39,9 +53,11 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from ocsim import experiment as X
+from ocsim import impact as IMP
 from ocsim import process_mining as pm
 from ocsim.parameters import STATE_ATTRIBUTES, extract_parameters
 from ocsim.policies import POLICY_LABELS, POLICY_SHORT, ScenarioConfig, make_policy_state
+import dataclasses
 from ocsim.ui_charts import (LOG_COLOR, MUTED, SERIES, bar_ci, color_for, hist_with_fit, style)
 
 # ---------------------------------------------------------------------------
@@ -68,9 +84,15 @@ st.markdown(
 # =============================================================== cache
 # Funções "caras" (ler o OCEL, ajustar distribuições, desenhar diagramas) são
 # executadas uma única vez por arquivo e reaproveitadas nas próximas interações.
+# Cada função recebe, além do caminho do arquivo, uma "chave" (key) que
+# identifica o arquivo; se a chave muda, o Streamlit sabe que precisa recalcular.
 def _file_hash(path: str) -> str:
-    """Identificador do arquivo (caminho + tamanho + data). Se o arquivo mudar,
-    o identificador muda e o cache é refeito."""
+    """Cria a "chave" de identificação de um arquivo.
+
+    Junta o caminho, o tamanho e a data de modificação do arquivo e passa por
+    uma função de hash (MD5). Um hash é como uma "impressão digital": transforma
+    qualquer texto num código curto (ex.: '3f9a1c0b7e21'); textos diferentes
+    geram códigos diferentes. Se o arquivo mudar, a chave muda e o cache é refeito."""
     h = hashlib.md5()
     st_ = os.stat(path)
     h.update(f"{path}|{st_.st_size}|{st_.st_mtime}".encode())
@@ -89,9 +111,9 @@ def load_params(path: str, key: str):
     return extract_parameters(load_data(path, key))
 
 
-@st.cache_resource(show_spinner="Calculando medidas do log real…")
+@st.cache_resource(show_spinner="Calculando medidas do log original…")
 def load_log_baseline(path: str, key: str, warmup: int, bucket: int):
-    """Mesmas métricas da simulação calculadas sobre o log real (referência)."""
+    """Mesmas métricas da simulação calculadas sobre o log original (referência)."""
     return X.log_baseline(load_data(path, key), load_params(path, key), warmup_days=warmup, bucket_days=bucket)
 
 
@@ -118,9 +140,31 @@ def flat_cached(path: str, key: str, otype: str):
     return pm.flatten(load_data(path, key), otype)
 
 
+@st.cache_data(show_spinner="Calculando o impacto entre objetos…")
+def impact_cached(path: str, key: str):
+    """Etapa 9: análises de impacto entre objetos (impact.py) para um OCEL."""
+    d = load_data(path, key)
+    a = IMP.supplier_to_customer(d)
+    a.pop("per_so", None)  # tabela grande, não é exibida
+    return {"fornecedor_cliente": a, "reposicao_falta": IMP.replenishment_to_stockout(d)}
+
+
+def simulated_ocel_path(rr: dict) -> tuple[str, str]:
+    """Grava (uma vez) o OCEL simulado de uma replicação em cache/ e devolve (caminho, chave)."""
+    sim_key = hashlib.md5(rr["ocel_json"][:2000].encode() + str(len(rr["ocel_json"])).encode()).hexdigest()[:12]
+    sim_path = CACHE / f"sim_{sim_key}.json"
+    if not sim_path.exists():
+        sim_path.write_text(rr["ocel_json"])
+    return str(sim_path), sim_key
+
+
 def show_svg(svg: str, height: int = 600):
-    """Exibe um SVG numa caixa com rolagem."""
-    # ajusta o SVG do Graphviz à largura disponível (mantém o viewBox)
+    """Exibe um diagrama SVG (formato de imagem vetorial gerado pelo Graphviz)
+    numa caixa com barra de rolagem."""
+    # O Graphviz grava no SVG uma largura e altura fixas (ex.: width="2400pt"),
+    # o que faria o diagrama vazar da tela. Esta linha procura esse trecho no
+    # texto do SVG (re.sub = "procurar e substituir") e troca por 100%, para o
+    # desenho se ajustar à largura disponível sem distorcer.
     svg = re.sub(r'<svg width="[^"]+" height="[^"]+"', '<svg width="100%" height="100%"', svg, count=1)
     st.components.v1.html(
         f'<div style="overflow:auto;height:{height - 10}px;border:1px solid #e6e5e0;border-radius:6px;'
@@ -143,14 +187,18 @@ if up is None:
     st.markdown(
         "Depois do envio, o app lê o log com o PM4Py, ajusta as distribuições e libera as etapas:\n\n"
         "1. Dados OCEL · 2. Mineração de processos · 3. Distribuições · 4. Cenários de reposição · "
-        "5. Simulação · 6. Validação · 7. Visão unificada · 8. Comparação de cenários · 9. Exportar\n\n"
+        "5. Simulação · 6. Validação · 7. Visão unificada · 8. Comparação de cenários · 9. Impacto entre objetos · "
+        "10. Exportar\n\n"
         "A primeira leitura de um arquivo grande (≈60 MB) leva de 10 a 20 segundos; depois fica em cache.")
     st.stop()
 
-# grava o arquivo enviado na pasta cache/ (o PM4Py lê a partir de um caminho em disco).
-# O nome inclui um resumo (hash) do conteúdo: o mesmo arquivo reaproveita o cache,
-# um arquivo diferente gera novo processamento.
-_buf = up.getbuffer()
+# O arquivo enviado chega à memória do Streamlit; o PM4Py, porém, só lê arquivos
+# gravados no disco. Por isso ele é salvo na pasta cache/.
+# O nome do arquivo salvo vem de um hash ("impressão digital") do conteúdo —
+# calculado só sobre o 1º e o último megabyte, para ser rápido. Assim, enviar
+# de novo o MESMO arquivo reaproveita o que já foi calculado, e um arquivo
+# DIFERENTE gera um novo processamento.
+_buf = up.getbuffer()  # conteúdo do arquivo enviado, em bytes
 _digest = hashlib.md5(bytes(_buf[:1_000_000]) + bytes(_buf[-1_000_000:]) + str(up.size).encode()).hexdigest()[:12]
 tmp = CACHE / f"upload_{_digest}.json"
 if not tmp.exists() or tmp.stat().st_size != up.size:
@@ -176,7 +224,8 @@ PAGES = [
     "6 · Validação (Atual × log)",
     "7 · Visão unificada (log × simulado)",
     "8 · Comparação de cenários",
-    "9 · Exportar",
+    "9 · Impacto entre objetos",
+    "10 · Exportar",
 ]
 page = st.sidebar.radio("Etapas", PAGES, index=0)
 st.sidebar.caption(f"Arquivo carregado: `{up.name}`")
@@ -220,13 +269,19 @@ if page == PAGES[0]:
         ("5 · Simulação", "Modelo SimPy centrado em objetos (OCPS): processos por tipo de objeto, eventos "
                           "compartilhados, N replicações por cenário com números aleatórios comuns."),
         ("6 · Validação", "O cenário Atual é comparado ao log (frequências, variantes, lead time, efeito chicote)."),
-        ("7 · Comparação", "Efeito chicote (razão de variâncias) por IL, Location, fornecedor e rede, "
+        ("8 · Comparação", "Efeito chicote (razão de variâncias) por IL, Location, fornecedor e rede, "
                            "nível de serviço e custos, com intervalos de confiança."),
+        ("9 · Impacto", "Como um tipo de objeto afeta outro: fornecedor → cliente, reposição → falta, "
+                        "demanda → pedidos, lead time → efeito chicote."),
     ]
     cols = st.columns(len(steps))
     for col, (t, txt) in zip(cols, steps):
         col.markdown(f"**{t}**")
         col.caption(txt)
+
+    # diagrama da arquitetura do projeto (assets/fluxo_projeto.png, gerado com Graphviz a partir de assets/fluxo.dot)
+    with st.expander("Arquitetura do projeto: módulos e fluxo dos dados", expanded=False):
+        st.image(str(ROOT / "assets" / "fluxo_projeto.png"), use_container_width=True)
 
     st.subheader("Recomendações de van der Aalst (2023) e onde estão no app")
     st.markdown(
@@ -235,8 +290,8 @@ if page == PAGES[0]:
         "| Usar dados centrados em objetos (E2O/O2O) em vez de um único caso | Modelo de objetos com 10 tipos, cardinalidades O2O e eventos compartilhados (etapa 1 e simulador) |\n"
         "| Achatamento gera deficiência, convergência e divergência | Diagnóstico por tipo de objeto (etapa 2, aba *Qualidade do achatamento*) |\n"
         "| Chegadas de objetos não são independentes; restringir o comportamento “subespecificado” da OCPN | Objetos transacionais nascem de outros objetos (SOI→IL; RP/PO pelo estado do IL), respeitando as cardinalidades |\n"
-        "| Primeiro reproduzir o processo real; só depois perguntar “e se?” | Etapa 6: cenário Atual × log |\n"
-        "| Visão unificada: minerar o log simulado como o real (as-is × to-be) | Etapa 7: OCEL simulado lido pelo PM4Py, lado a lado com o real |\n"
+        "| Primeiro reproduzir o processo do log; só depois perguntar “e se?” | Etapa 6: cenário Atual × log |\n"
+        "| Visão unificada: minerar o log simulado como o original (as-is × to-be) | Etapa 7: OCEL simulado lido pelo PM4Py, lado a lado com o original |\n"
         "| Simulação de curto prazo a partir do estado atual (análise transitória) | Etapa 5: estado inicial = fim do log (estoques e POs em aberto) |")
     st.subheader("Modelo de objetos")
     st.image(str(ROOT / "assets" / "modelo_objetos.png"), use_container_width=True,
@@ -583,10 +638,13 @@ elif page == PAGES[5]:
                                                "estacionario": "estacionário"}[x])
     exc = c[2].toggle("Incluir eventos de exceção", True,
                       help="Ajustes de inventário, contagens, transferências, lacunas de dados, alteração de limites.")
-    par = c[3].toggle("Usar vários núcleos", True)
+    # paralelismo ligado por padrão só no Linux (no Windows/macOS pode travar dentro do Streamlit)
+    par = c[3].toggle("Usar vários núcleos", X.parallel_supported(),
+                      help="Distribui as replicações entre os núcleos do processador. No Windows e no macOS vem "
+                           "desligado; se ligado e travar, o app volta sozinho ao modo sequencial após ~90 s.")
     bucket = st.select_slider("Agregação para o efeito chicote", options=[1, 7, 14, 30], value=7,
                               format_func=lambda x: {1: "diária", 7: "semanal", 14: "quinzenal", 30: "mensal"}[x])
-    rec = st.multiselect("Gerar OCEL simulado (replicação 1) para — usado na visão unificada (etapa 7)",
+    rec = st.multiselect("Gerar OCEL simulado (replicação 1) para — usado nas etapas 7 (visão unificada) e 9 (impacto entre objetos)",
                          [s.label() for s in scs], default=[s.label() for s in scs if s.policy == "ATUAL"])
     if init == "estado_atual":
         st.info("No curto prazo, o efeito chicote dos cenários diferentes do Atual inclui o **efeito de transição** "
@@ -600,13 +658,15 @@ elif page == PAGES[5]:
         opts = {"horizon_days": float(horizon), "warmup_days": int(warm), "bucket_days": int(bucket),
                 "include_exceptions": exc, "sampling_mode": mode, "demand_model": dm,
                 "record_ocel_scenarios": rec, "initial_state": init, "inherit_backorders": inherit}
+        # "progress=lambda f, m: ..." passa uma pequena função que a simulação chama a
+        # cada replicação concluída, para avançar a barra de progresso (f = fração, m = mensagem)
         res = X.run_experiment(P, scs, int(n_reps), int(seed), opts,
                                progress=lambda f, m: bar.progress(min(f, 1.0), m), parallel=par)
         st.session_state["results"] = res
         st.session_state["opts"] = opts
         st.session_state["run_scenarios"] = scs
         bar.progress(1.0, "Concluído")
-        st.success("Simulação concluída. Veja as etapas 6 (validação), 7 (visão unificada) e 8 (comparação).")
+        st.success("Simulação concluída. Veja as etapas 6 (validação), 7 (visão unificada), 8 (comparação) e 9 (impacto entre objetos).")
     if "results" in st.session_state:
         df = X.results_frame(st.session_state["results"])
         st.subheader("Resultados por replicação")
@@ -695,17 +755,17 @@ elif page == PAGES[6]:
     fig.add_trace(go.Scatter(x=[0, mx], y=[0, mx], mode="lines", line=dict(color=MUTED, dash="dot"), name="y = x"))
     st.plotly_chart(style(fig, 380, xtitle="BWE no log", ytitle="BWE simulado", legend=False), use_container_width=True)
 
-    st.caption("Para analisar o OCEL simulado com as mesmas técnicas de mineração usadas no log real "
+    st.caption("Para analisar o OCEL simulado com as mesmas técnicas de mineração usadas no log original "
                "(OC-DFG, variantes, desempenho), veja a etapa 7.")
 
 # ===================================================================== 7
 # ETAPA 7 — Visão unificada (van der Aalst): o OCEL simulado é gravado em
 # disco e lido pelo PM4Py exatamente como o original, permitindo comparar
-# real × simulado com as mesmas técnicas de mineração.
+# original × simulado com as mesmas técnicas de mineração.
 elif page == PAGES[7]:
-    header("Etapa 7", "Visão unificada: log real × log simulado",
+    header("Etapa 7", "Visão unificada: log original × log simulado",
            "Van der Aalst (2023) propõe analisar o log simulado **com as mesmas técnicas** de mineração de "
-           "processos usadas no log real: assim o processo “as is” e os possíveis “to be” são vistos pela mesma "
+           "processos usadas no log original: assim o processo “as is” e os possíveis “to be” são vistos pela mesma "
            "lente (mineração comparativa). Aqui o OCEL simulado de cada cenário é lido pelo PM4Py exatamente "
            "como o original.")
     res = st.session_state.get("results")
@@ -720,21 +780,21 @@ elif page == PAGES[7]:
     if not sim_path.exists():
         sim_path.write_text(rr["ocel_json"])
     DS = load_data(str(sim_path), sim_key)
-    days_real, days_sim = D.horizon_days, max(DS.horizon_days, 1)
+    days_orig, days_sim = D.horizon_days, max(DS.horizon_days, 1)
     c = st.columns(4)
-    c[0].metric("Eventos (real)", f"{len(D.events):,}".replace(",", "."))
+    c[0].metric("Eventos (original)", f"{len(D.events):,}".replace(",", "."))
     c[1].metric("Eventos (simulado)", f"{len(DS.events):,}".replace(",", "."))
-    c[2].metric("Horizonte real (dias)", f"{days_real:.0f}")
+    c[2].metric("Horizonte original (dias)", f"{days_orig:.0f}")
     c[3].metric("Horizonte simulado (dias)", f"{days_sim:.0f}")
 
     tabs = st.tabs(["Atividades por dia", "Variantes por tipo de objeto", "Desempenho (DFG)", "OC-DFG simulado",
                     "Modelo de objetos"])
     with tabs[0]:
-        a = (D.events[pm.ACT].value_counts() / days_real).rename("real")
+        a = (D.events[pm.ACT].value_counts() / days_orig).rename("original")
         b = (DS.events[pm.ACT].value_counts() / days_sim).rename("simulado")
-        t = pd.concat([a, b], axis=1).fillna(0).sort_values("real", ascending=False)
+        t = pd.concat([a, b], axis=1).fillna(0).sort_values("original", ascending=False)
         fig = go.Figure()
-        fig.add_trace(go.Bar(y=t.index, x=t["real"], name="real", orientation="h", marker=dict(color=LOG_COLOR, cornerradius=3)))
+        fig.add_trace(go.Bar(y=t.index, x=t["original"], name="original", orientation="h", marker=dict(color=LOG_COLOR, cornerradius=3)))
         fig.add_trace(go.Bar(y=t.index, x=t["simulado"], name=f"simulado — {POLICY_SHORT.get(rr['policy'], sc)}",
                              orientation="h", marker=dict(color=color_for(rr["policy"]), cornerradius=3)))
         fig.update_xaxes(type="log")
@@ -745,7 +805,7 @@ elif page == PAGES[7]:
         ot = st.selectbox("Tipo de objeto", ["SalesOrderItem", "PurchaseOrderItem", "ReplenishmentProposal", "TransferOrder"])
         c1, c2 = st.columns(2)
         with c1:
-            st.markdown("**Real**")
+            st.markdown("**Original**")
             st.dataframe(pm.variants(flat_cached(path, KEY, ot), 10).round(2), use_container_width=True)
         with c2:
             st.markdown("**Simulado**")
@@ -760,18 +820,18 @@ elif page == PAGES[7]:
             ps = pm.performance_dfg_table(flat_cached(str(sim_path), sim_key, ot2))
             m = pr[["de", "para", "frequência", "média (h)", "mediana (h)"]].merge(
                 ps[["de", "para", "frequência", "média (h)", "mediana (h)"]], on=["de", "para"], how="outer",
-                suffixes=(" real", " sim"))
+                suffixes=(" original", " sim"))
             st.dataframe(m.round(2), use_container_width=True, hide_index=True)
-            mm = m.dropna(subset=["média (h) real", "média (h) sim"])
-            fig = go.Figure(go.Scatter(x=mm["média (h) real"], y=mm["média (h) sim"], mode="markers",
+            mm = m.dropna(subset=["média (h) original", "média (h) sim"])
+            fig = go.Figure(go.Scatter(x=mm["média (h) original"], y=mm["média (h) sim"], mode="markers",
                                        text=mm["de"] + " → " + mm["para"],
                                        marker=dict(size=10, color=SERIES[0], line=dict(color="white", width=1.5)),
-                                       hovertemplate="%{text}<br>real: %{x:.2f} h<br>sim: %{y:.2f} h<extra></extra>"))
-            mx = float(max(mm["média (h) real"].max(), mm["média (h) sim"].max(), 1))
+                                       hovertemplate="%{text}<br>original: %{x:.2f} h<br>sim: %{y:.2f} h<extra></extra>"))
+            mx = float(max(mm["média (h) original"].max(), mm["média (h) sim"].max(), 1))
             fig.add_trace(go.Scatter(x=[0.001, mx], y=[0.001, mx], mode="lines", line=dict(color=MUTED, dash="dot")))
             fig.update_xaxes(type="log")
             fig.update_yaxes(type="log")
-            st.plotly_chart(style(fig, 380, "Tempo médio entre atividades: real × simulado", xtitle="real (h)",
+            st.plotly_chart(style(fig, 380, "Tempo médio entre atividades: original × simulado", xtitle="original (h)",
                                   ytitle="simulado (h)", legend=False), use_container_width=True)
     with tabs[3]:
         ots = [t for t in pm.OT_ORDER if t in set(DS.objects[pm.OTYPE])]
@@ -783,7 +843,7 @@ elif page == PAGES[7]:
     with tabs[4]:
         st.markdown("Objetos gerados por tipo e cardinalidades O2O no log simulado (compare com a etapa 1).")
         c1, c2 = st.columns(2)
-        c1.dataframe(D.objects[pm.OTYPE].value_counts().rename("real"), use_container_width=True)
+        c1.dataframe(D.objects[pm.OTYPE].value_counts().rename("original"), use_container_width=True)
         c2.dataframe(DS.objects[pm.OTYPE].value_counts().rename("simulado"), use_container_width=True)
         cs_ = pm.o2o_cardinalities(DS)
         st.dataframe(cs_[["origem", "qualificador", "destino", "ligações", "cardinalidade", "média destino/origem"]],
@@ -842,7 +902,7 @@ elif page == PAGES[8]:
         a = agg("BWE mediano IL")
         c2.plotly_chart(bar_ci(a, "m", "lo", "hi", "cenário", pols, "BWE mediano por ItemLocation", "BWE",
                                ref=lb["bw"]["summary"]["BWE mediano IL"]), use_container_width=True)
-        st.caption("Linha tracejada: valor medido no log real. Linha pontilhada: BWE = 1 (sem amplificação). "
+        st.caption("Linha tracejada: valor medido no log original. Linha pontilhada: BWE = 1 (sem amplificação). "
                    "O BWE da rede agrega todas as ILs (as flutuações individuais se compensam); o BWE mediano "
                    "por IL mostra a amplificação em cada elo.")
         fig = go.Figure()
@@ -850,7 +910,7 @@ elif page == PAGES[8]:
             v = pd.concat([pd.DataFrame(r["bw_per_il"]) for r in res if r["scenario"] == sc])["BWE"].dropna()
             fig.add_trace(go.Box(y=v, name=POLICY_SHORT.get(pol_of[sc], sc), marker_color=color_for(pol_of[sc], i),
                                  boxpoints="outliers", line=dict(width=1.5)))
-        fig.add_trace(go.Box(y=lb["bw"]["per_il"]["BWE"].dropna(), name="Log real", marker_color=LOG_COLOR))
+        fig.add_trace(go.Box(y=lb["bw"]["per_il"]["BWE"].dropna(), name="Log original", marker_color=LOG_COLOR))
         fig.update_yaxes(type="log")
         st.plotly_chart(style(fig, 420, "Distribuição do BWE entre ItemLocations (todas as replicações)",
                               ytitle="BWE (escala log)", legend=False), use_container_width=True)
@@ -865,7 +925,7 @@ elif page == PAGES[8]:
             fig.add_trace(go.Bar(x=levels, y=[r[l_] for l_ in levels], name=r["cenário"],
                                  marker=dict(color=color_for(r["policy"], i), cornerradius=3)))
         fig.add_trace(go.Scatter(x=levels, y=[lb["bw"]["levels"].get(l_, np.nan) for l_ in levels], mode="markers",
-                                 name="Log real", marker=dict(symbol="line-ew", size=26, color=LOG_COLOR,
+                                 name="Log original", marker=dict(symbol="line-ew", size=26, color=LOG_COLOR,
                                                               line=dict(width=3, color=LOG_COLOR))))
         fig.update_yaxes(type="log")
         st.plotly_chart(style(fig, 440, "BWE por nível de agregação", ytitle="BWE (escala log)"),
@@ -877,7 +937,7 @@ elif page == PAGES[8]:
         per = pd.concat([pd.DataFrame(r["bw_per_il"]).assign(cenário=POLICY_SHORT.get(r["policy"], r["scenario"]))
                          for r in res])
         piv = per.groupby(["il", "cenário"])["BWE"].mean().unstack()[[POLICY_SHORT.get(p, p) for p in pols]]
-        piv["Log real"] = lb["bw"]["per_il"].set_index("il")["BWE"]
+        piv["Log original"] = lb["bw"]["per_il"].set_index("il")["BWE"]
         info = pd.DataFrame({il: {"classe": ip.material_class, "location": ip.location,
                                   "demanda/dia": ip.daily_mean} for il, ip in P.item_locations.items()}).T
         st.dataframe(info.join(piv).round(2), use_container_width=True, height=500)
@@ -931,7 +991,7 @@ elif page == PAGES[8]:
         fig = go.Figure()
         fig.add_trace(go.Scatter(y=lw, mode="lines", name="demanda (log)", line=dict(color=LOG_COLOR, width=2)))
         fig.add_trace(go.Scatter(y=lo_, mode="lines", name="pedidos (log)", line=dict(color=SERIES[6], width=2)))
-        st.plotly_chart(style(fig, 300, f"Referência: log real — {il}", xtitle="semana", ytitle="unidades"),
+        st.plotly_chart(style(fig, 300, f"Referência: log original — {il}", xtitle="semana", ytitle="unidades"),
                         use_container_width=True)
     # aba: tabela-resumo com IC 95% e download
     with t[5]:
@@ -940,9 +1000,189 @@ elif page == PAGES[8]:
                            "resultados_replicacoes.csv", "text/csv")
 
 # ===================================================================== 9
-# ETAPA 9 — Exportar: CSVs de resultados e parâmetros e OCELs simulados.
+# ETAPA 9 — Impacto entre objetos: mede como um tipo de objeto afeta outro
+# (fornecedor → cliente, cadeia de reposição → falta de estoque, demanda →
+# pedidos, lead time do fornecedor → efeito chicote). Funciona para o log
+# original e para os logs simulados (impact.py).
 elif page == PAGES[9]:
-    header("Etapa 9", "Exportar")
+    header("Etapa 9", "Impacto entre objetos",
+           "Estas análises só são possíveis porque o OCEL liga objetos de tipos diferentes (relações E2O e O2O). "
+           "Com um log tradicional, de um único tipo de caso, a demanda (SalesOrderItem) e os pedidos ao "
+           "fornecedor (PurchaseOrderItem) ficariam em logs separados e o vínculo entre eles — o ItemLocation — "
+           "se perderia. É o argumento central para usar mineração de processos **centrada em objetos** no "
+           "estudo do efeito chicote.")
+    res = st.session_state.get("results") or []
+
+    # --- logs disponíveis: o original + os OCELs simulados gravados na etapa 5
+    sources = {"Log original": (path, KEY, None)}
+    for rr in res:
+        if rr.get("ocel_json"):
+            sp, sk = simulated_ocel_path(rr)
+            sources[f"Simulado — {POLICY_SHORT.get(rr['policy'], rr['scenario'])}"] = (sp, sk, rr["policy"])
+    if len(sources) == 1:
+        st.info("Por enquanto só o log original está disponível. Para comparar com logs simulados, escolha "
+                "cenários em “Gerar OCEL simulado” na etapa 5 e execute a simulação.")
+    impacts = {name: impact_cached(p_, k_) for name, (p_, k_, _) in sources.items()}
+
+    def src_color(name, i):
+        pol = sources[name][2]
+        return LOG_COLOR if pol is None else color_for(pol, i)
+
+    t1, t2, t3, t4 = st.tabs(["1 · Fornecedor → cliente", "2 · Reposição → falta de estoque",
+                              "3 · Demanda → pedidos", "4 · Lead time → efeito chicote"])
+
+    # ------------------------------------------------------------- análise 1
+    with t1:
+        st.markdown(
+            "**Pergunta:** a situação dos **pedidos de compra** (PurchaseOrderItem) de um ItemLocation afeta os "
+            "**pedidos de venda** (SalesOrderItem) do mesmo ItemLocation?\n\n"
+            "No instante em que cada pedido de venda é criado, o IL é classificado em: *sem pedido de compra em "
+            "aberto*, *pedido em aberto no prazo* ou *pedido em aberto atrasado* (idade maior que a mediana do lead "
+            "time). Para não confundir ILs de demanda alta e baixa, a medida principal é o **excesso de backorder "
+            "em relação à média do próprio IL**, em pontos percentuais (p.p.).")
+        fig = go.Figure()
+        for i, (name, imp) in enumerate(impacts.items()):
+            sm = imp["fornecedor_cliente"]["summary"]
+            fig.add_trace(go.Bar(x=sm["situação do abastecimento"], y=sm["excesso_vs_media_do_il"], name=name,
+                                 marker=dict(color=src_color(name, i), cornerradius=3),
+                                 hovertemplate="%{x}<br>%{y:+.1f} p.p.<extra>" + name + "</extra>"))
+        fig.add_hline(y=0, line=dict(color=MUTED, width=1))
+        st.plotly_chart(style(fig, 380, "Excesso de backorder (p.p.) conforme a situação do abastecimento",
+                              ytitle="p.p. acima/abaixo da média do IL"), use_container_width=True)
+        orig = impacts["Log original"]["fornecedor_cliente"]
+        c1, c2 = st.columns(2)
+        with c1:
+            st.markdown("**Log original — detalhe**")
+            st.dataframe(orig["summary"].rename(columns={
+                "pedidos_de_venda": "pedidos de venda", "pct_backorder_bruto": "% backorder",
+                "excesso_vs_media_do_il": "excesso (p.p.)"}).round(1), hide_index=True, use_container_width=True)
+            st.caption(f"Pedido “atrasado”: em aberto há mais de {orig['overdue_days']:.1f} dias (mediana do lead "
+                       f"time). Teste de Mann–Whitney (atrasado > no prazo): p = {orig['test_p']:.3g}.")
+        with c2:
+            fig = go.Figure()
+            for i, (name, imp) in enumerate(impacts.items()):
+                bw = imp["fornecedor_cliente"]["by_wait"]
+                fig.add_trace(go.Scatter(x=bw["faixa de espera"].astype(str), y=bw["excesso_vs_media_do_il"],
+                                         mode="lines+markers", name=name,
+                                         line=dict(color=src_color(name, i), width=2), marker=dict(size=8)))
+            fig.add_hline(y=0, line=dict(color=MUTED, width=1))
+            st.plotly_chart(style(fig, 330, "Excesso de backorder × há quanto tempo o IL espera o fornecedor",
+                                  xtitle="idade do pedido de compra mais antigo em aberto", ytitle="p.p."),
+                            use_container_width=True)
+        st.markdown(
+            '<div class="note"><b>Como ler.</b> Valores positivos indicam que, naquela situação, os pedidos de '
+            'venda do IL viram backorder com mais frequência que o normal para aquele IL. A diferença entre '
+            '“sem pedido em aberto” e “pedido em aberto” mostra o vínculo entre os dois tipos de objeto: a falta '
+            'de estoque que o cliente sente coincide com o período em que o IL espera a reposição. Se a curva '
+            'do simulado acompanha a do original, o simulador reproduz também essa interação entre objetos.</div>',
+            unsafe_allow_html=True)
+
+    # ------------------------------------------------------------- análise 2
+    with t2:
+        st.markdown(
+            "**Pergunta:** quais características da **cadeia de reposição** de cada ItemLocation (lead time dos "
+            "PurchaseOrderItem, tempo de aprovação das ReplenishmentProposal, nº de pedidos de compra) estão "
+            "associadas à **falta de estoque** sentida pelos SalesOrderItem? Cada ponto é um IL; a medida é a "
+            "correlação de Spearman (ρ), que capta relações monotônicas.")
+        rows = []
+        for name, imp in impacts.items():
+            cr = imp["reposicao_falta"]["correlations"].copy()
+            cr.insert(0, "log", name)
+            rows.append(cr)
+        st.dataframe(pd.concat(rows).round(3), hide_index=True, use_container_width=True)
+        sel = st.selectbox("Log", list(impacts))
+        pi = impacts[sel]["reposicao_falta"]["per_il"]
+        xvar = st.radio("Eixo x", ["pedidos de venda/dia", "lead time médio (dias)", "aprovação média (dias)"],
+                        horizontal=True)
+        fig = go.Figure(go.Scatter(x=pi[xvar], y=pi["% backorder"], mode="markers", text=pi["il"],
+                                   marker=dict(size=10, color=src_color(sel, 0), line=dict(color="white", width=1.5)),
+                                   hovertemplate="%{text}<br>x: %{x:.2f}<br>% backorder: %{y:.1f}<extra></extra>"))
+        st.plotly_chart(style(fig, 380, f"% de pedidos de venda em backorder por IL — {sel}", xtitle=xvar,
+                              ytitle="% backorder", legend=False), use_container_width=True)
+        st.caption("Correlação não é causalidade: ILs de demanda alta também emitem mais pedidos de compra. Por "
+                   "isso a análise 4 usa o simulador para isolar o efeito do lead time.")
+
+    # ------------------------------------------------------------- análise 3
+    with t3:
+        st.markdown(
+            "**Pergunta:** como a demanda dos **SalesOrderItem** se transmite aos **PurchaseOrderItem** em cada "
+            "política? Mostramos a correlação entre a demanda da semana *t* e os pedidos ao fornecedor da semana "
+            "*t + k*. Um pico em *k* indica que a política reage à demanda com *k* semanas de atraso; correlações "
+            "baixas com pedidos muito variáveis indicam que a variabilidade dos pedidos **não vem da demanda**, e "
+            "sim da própria regra de reposição — a origem do efeito chicote.")
+        level = st.radio("Nível", ["correlação mediana por IL", "correlação rede"], horizontal=True)
+        fig = go.Figure()
+        lr = IMP.lagged_response(load_log_baseline(path, KEY, 56, 7)["weekly_demand"],
+                                 load_log_baseline(path, KEY, 56, 7)["weekly_orders"])
+        fig.add_trace(go.Scatter(x=lr["defasagem (semanas)"], y=lr[level], mode="lines+markers", name="Log original",
+                                 line=dict(color=LOG_COLOR, width=2, dash="dash")))
+        if res:
+            scen = list(dict.fromkeys(r["scenario"] for r in res))
+            for i, sc in enumerate(scen):
+                reps = [r for r in res if r["scenario"] == sc]
+                curves = [IMP.lagged_response(r["weekly_demand"], r["weekly_orders"])[level].to_numpy() for r in reps]
+                fig.add_trace(go.Scatter(x=lr["defasagem (semanas)"], y=np.nanmean(curves, axis=0),
+                                         mode="lines+markers", name=POLICY_SHORT.get(reps[0]["policy"], sc),
+                                         line=dict(color=color_for(reps[0]["policy"], i), width=2)))
+        else:
+            st.info("Execute a simulação (etapa 5) para comparar as políticas.")
+        fig.add_hline(y=0, line=dict(color=MUTED, width=1))
+        st.plotly_chart(style(fig, 400, "Correlação demanda(t) × pedidos(t + k)", xtitle="defasagem k (semanas)",
+                              ytitle="correlação"), use_container_width=True)
+
+    # ------------------------------------------------------------- análise 4
+    with t4:
+        st.markdown(
+            "**Pergunta:** quanto o comportamento do **Supplier** (lead time) muda o efeito chicote e o serviço dos "
+            "**ItemLocation**? Aqui o simulador funciona como experimento controlado: só o lead time do fornecedor "
+            "muda (multiplicado pelo fator), todo o resto fica igual (mesmas sementes).")
+        scs = st.session_state.get("scenarios")
+        if not scs:
+            from ocsim.policies import default_scenarios
+            scs = default_scenarios()
+        c = st.columns(3)
+        factors = c[0].multiselect("Fatores de lead time", [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0],
+                                   default=[0.5, 1.0, 1.5, 2.0])
+        n_rep = c[1].number_input("Replicações por ponto", 1, 50, 3)
+        par = c[2].toggle("Usar vários núcleos", X.parallel_supported(), key="par_sens")
+        st.caption(f"{len(factors) * len(scs) * n_rep} replicações no total.")
+        if st.button("▶ Rodar análise de sensibilidade", type="primary") and factors:
+            bar = st.progress(0.0, "Iniciando…")
+            out = []
+            for j, f in enumerate(sorted(factors)):
+                # cópia de cada cenário, mudando apenas o fator de lead time
+                sc_f = [dataclasses.replace(sc, lead_time_factor=float(f)) for sc in scs]
+                rr = X.run_experiment(P, sc_f, int(n_rep), 42, {"warmup_days": 56, "bucket_days": 7},
+                                      parallel=par,
+                                      progress=lambda fr, m, j=j: bar.progress(min((j + fr) / len(factors), 1.0),
+                                                                               f"fator {f}: {m}"))
+                dfr = X.results_frame(rr)
+                dfr["fator de lead time"] = f
+                out.append(dfr)
+            st.session_state["sens"] = pd.concat(out)
+            bar.progress(1.0, "Concluído")
+        sens = st.session_state.get("sens")
+        if sens is not None:
+            c1, c2 = st.columns(2)
+            for col, metric, ttl in [(c1, "BWE rede", "Efeito chicote da rede"),
+                                     (c2, "nível de serviço (fill rate)", "Nível de serviço (fill rate)")]:
+                fig = go.Figure()
+                for i, (sc, g) in enumerate(sens.groupby("cenário", sort=False)):
+                    m = g.groupby("fator de lead time")[metric].mean()
+                    pol = g["política"].iloc[0]
+                    fig.add_trace(go.Scatter(x=m.index, y=m.values, mode="lines+markers",
+                                             name=POLICY_SHORT.get(pol, sc),
+                                             line=dict(color=color_for(pol, i), width=2), marker=dict(size=8)))
+                col.plotly_chart(style(fig, 380, ttl, xtitle="fator do lead time do fornecedor", ytitle=metric),
+                                 use_container_width=True)
+            st.dataframe(sens.groupby(["cenário", "fator de lead time"], sort=False)[
+                ["BWE rede", "BWE mediano IL", "nível de serviço (fill rate)", "custo total"]].mean().round(3),
+                use_container_width=True)
+
+# ===================================================================== 10
+# ETAPA 10 — Exportar: CSVs de resultados e parâmetros e OCELs simulados.
+elif page == PAGES[10]:
+    header("Etapa 10", "Exportar")
     res = st.session_state.get("results")
     if res:
         df = X.results_frame(res)

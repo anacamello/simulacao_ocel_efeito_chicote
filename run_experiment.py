@@ -70,7 +70,7 @@ def main():
     summ.to_csv(out / "resumo_cenarios.csv", index=False)
     lb = X.log_baseline(d, P, a.warmup, a.bucket)
     print(summ[["cenário"] + cols].round(3).to_string(index=False))
-    print(f"\nLog real: BWE rede = {lb['bw']['summary']['BWE rede']:.3f}; "
+    print(f"\nLog original: BWE rede = {lb['bw']['summary']['BWE rede']:.3f}; "
           f"BWE mediano IL = {lb['bw']['summary']['BWE mediano IL']:.3f}")
     X.validation_table(lb, [r for r in res if r["policy"] == "ATUAL"]).to_csv(out / "validacao_atual_vs_log.csv", index=False)
     print(f"Arquivos salvos em {out.resolve()}")

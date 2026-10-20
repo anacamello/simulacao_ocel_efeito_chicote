@@ -15,6 +15,12 @@ python run_experiment.py --ocel caminho/do/arquivo_ocel.json --reps 30   # execu
 O arquivo OCEL **sempre** precisa ser enviado: na interface, pelo campo de upload na barra lateral
 (o app só libera as etapas depois do envio); na execução em lote, pelo argumento obrigatório `--ocel`.
 
+## Arquitetura
+
+![Fluxo do projeto](assets/fluxo_projeto.png)
+
+O diagrama é gerado com Graphviz a partir de `assets/fluxo.dot` (`dot -Tpng -Gdpi=220 assets/fluxo.dot -o assets/fluxo_projeto.png`).
+
 ## Etapas (interface)
 
 | Etapa | O que faz | Módulo |
@@ -25,9 +31,10 @@ O arquivo OCEL **sempre** precisa ser enviado: na interface, pelo campo de uploa
 | 4 · Cenários | regras de reposição e seus parâmetros | `ocsim/policies.py` |
 | 5 · Simulação | modelo SimPy centrado em objetos, N replicações (escolhidas pelo usuário) | `ocsim/simulation.py`, `ocsim/experiment.py` |
 | 6 · Validação | cenário Atual × log (frequências, variantes, lead time, efeito chicote) | `ocsim/experiment.py` |
-| 7 · Visão unificada | OCEL simulado minerado com PM4Py lado a lado com o real (atividades/dia, variantes, DFG de desempenho, OC-DFG, modelo de objetos) | `app.py` |
+| 7 · Visão unificada | OCEL simulado minerado com PM4Py lado a lado com o original (atividades/dia, variantes, DFG de desempenho, OC-DFG, modelo de objetos) | `app.py` |
 | 8 · Comparação | efeito chicote por IL / Location / fornecedor / rede, serviço e custos, IC 95% | `ocsim/metrics.py` |
-| 9 · Exportar | CSVs e OCEL simulado (mesmo esquema do original) | — |
+| 9 · Impacto entre objetos | fornecedor → cliente, reposição → falta de estoque, demanda → pedidos (correlação defasada) e sensibilidade do BWE ao lead time; log original × simulados | `ocsim/impact.py` |
+| 10 · Exportar | CSVs e OCEL simulado (mesmo esquema do original) | — |
 
 ## Correspondência com o OCPS
 
@@ -49,8 +56,8 @@ O arquivo OCEL **sempre** precisa ser enviado: na interface, pelo campo de uploa
 | Dados centrados em objetos (E2O/O2O) em vez de um único caso | modelo de objetos + eventos compartilhados |
 | Achatamento causa deficiência, convergência e divergência | etapa 2, aba *Qualidade do achatamento* (convergência = 0% neste log) |
 | Chegadas de objetos dependem de outros objetos; limitar o comportamento subespecificado da OCPN | SOI nasce do IL; RP/PO nascem do estado do IL; cardinalidades O2O respeitadas |
-| Reproduzir o real antes de perguntar “e se?” | etapa 6 |
-| Visão unificada (minerar o log simulado como o real; as-is × to-be) | etapa 7 |
+| Reproduzir o log original antes de perguntar “e se?” | etapa 6 |
+| Visão unificada (minerar o log simulado como o original; as-is × to-be) | etapa 7 |
 | Simulação de curto prazo a partir do estado atual | etapa 5, *estado inicial = fim do log* (estoques e 20 POs em aberto) |
 
 ## Cenários de reposição
