@@ -52,8 +52,25 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
-from ocsim import experiment as X
-from ocsim import impact as IMP
+# ---------------------------------------------------------------------------
+# Conferência de versão: app.py e a pasta ocsim/ precisam ser da MESMA versão.
+# Se só alguns arquivos forem atualizados (ex.: no GitHub / Streamlit Cloud),
+# o app mostra uma mensagem clara em vez de um erro técnico.
+# ---------------------------------------------------------------------------
+APP_VERSION = "2026.10.20"
+st.set_page_config(page_title="Simulação OCEL · Efeito Chicote", page_icon="🔗", layout="wide")
+import ocsim  # noqa: E402
+if getattr(ocsim, "__version__", None) != APP_VERSION:
+    st.error(
+        f"**Arquivos do projeto desatualizados.** O app.py é da versão {APP_VERSION}, mas a pasta "
+        f"`ocsim/` é da versão {getattr(ocsim, '__version__', 'antiga (sem número)')}.\n\n"
+        "Substitua **todos** os arquivos do projeto (app.py, run_experiment.py, requirements.txt e a pasta "
+        "`ocsim/` inteira) pelos do zip mais recente. No Streamlit Cloud, envie todos para o GitHub e depois "
+        "use **Manage app → Reboot app**.")
+    st.stop()
+
+from ocsim import experiment as X  # noqa: E402
+from ocsim import impact as IMP  # noqa: E402
 from ocsim import process_mining as pm
 from ocsim.parameters import STATE_ATTRIBUTES, extract_parameters
 from ocsim.policies import POLICY_LABELS, POLICY_SHORT, ScenarioConfig, make_policy_state
@@ -66,8 +83,6 @@ from ocsim.ui_charts import (LOG_COLOR, MUTED, SERIES, bar_ci, color_for, hist_w
 ROOT = Path(__file__).parent                 # pasta do projeto
 CACHE = ROOT / "cache"                       # SVGs e OCELs simulados gerados pelo app
 CACHE.mkdir(exist_ok=True)
-
-st.set_page_config(page_title="Simulação OCEL · Efeito Chicote", page_icon="🔗", layout="wide")
 
 # pequenos ajustes visuais (CSS)
 st.markdown(
@@ -198,11 +213,15 @@ if up is None:
 # calculado só sobre o 1º e o último megabyte, para ser rápido. Assim, enviar
 # de novo o MESMO arquivo reaproveita o que já foi calculado, e um arquivo
 # DIFERENTE gera um novo processamento.
-_buf = up.getbuffer()  # conteúdo do arquivo enviado, em bytes
-_digest = hashlib.md5(bytes(_buf[:1_000_000]) + bytes(_buf[-1_000_000:]) + str(up.size).encode()).hexdigest()[:12]
+# getvalue() devolve uma CÓPIA do conteúdo (em bytes). Não usamos getbuffer(),
+# que dá acesso direto à memória do arquivo enviado: esse acesso impedia o
+# Streamlit de liberar o arquivo no fim de cada execução (erro "BufferError").
+_data = up.getvalue()
+_digest = hashlib.md5(_data[:1_000_000] + _data[-1_000_000:] + str(up.size).encode()).hexdigest()[:12]
 tmp = CACHE / f"upload_{_digest}.json"
 if not tmp.exists() or tmp.stat().st_size != up.size:
-    tmp.write_bytes(_buf)
+    tmp.write_bytes(_data)
+del _data  # libera a cópia (60 MB) da memória
 path = str(tmp)
 KEY = _file_hash(path)
 
