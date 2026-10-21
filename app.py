@@ -73,7 +73,7 @@ from ocsim import experiment as X  # noqa: E402
 from ocsim import impact as IMP  # noqa: E402
 from ocsim import process_mining as pm
 from ocsim.parameters import STATE_ATTRIBUTES, extract_parameters
-from ocsim.policies import POLICY_LABELS, POLICY_SHORT, ScenarioConfig, make_policy_state
+from ocsim.policies import POLICY_LABELS, POLICY_SHORT, ScenarioConfig, make_policy_state, short_from_label
 import dataclasses
 from ocsim.ui_charts import (LOG_COLOR, MUTED, SERIES, bar_ci, color_for, hist_with_fit, style)
 
@@ -251,6 +251,29 @@ st.sidebar.caption(f"Arquivo carregado: `{up.name}`")
 if "results" in st.session_state:
     st.sidebar.success(f"{len(st.session_state['results'])} replicações em memória")
 
+# --- métrica do efeito chicote usada nas etapas 6, 8 e 9 (as duas são sempre
+#     calculadas; aqui só se escolhe qual aparece nos gráficos)
+BW_METRICS = {
+    "BWE": {"nome": "razão de variâncias", "sigla": "BWE",
+            "formula": "Var(pedidos ao fornecedor) / Var(demanda do cliente)", "levels": "levels",
+            "res_levels": "bw_levels"},
+    "BWE_CV": {"nome": "coeficiente de variação", "sigla": "BWE (CV)",
+               "formula": "CV(pedidos ao fornecedor) / CV(demanda do cliente), com CV = desvio-padrão / média",
+               "levels": "levels_cv", "res_levels": "bw_levels_cv"},
+}
+BW = st.sidebar.radio("Métrica do efeito chicote", list(BW_METRICS),
+                      format_func=lambda k: BW_METRICS[k]["nome"].capitalize(), key="bw_metric",
+                      help="Razão de variâncias (Chen et al., 2000) ou razão de coeficientes de variação "
+                           "(Fransoo & Wouters, 2000). As duas são calculadas em toda simulação; "
+                           "esta opção só escolhe a que aparece nas etapas 6, 8 e 9.")
+BWM = BW_METRICS[BW]
+BWS = BWM["sigla"]          # rótulo curto para eixos e títulos
+
+
+def has_cv(results) -> bool:
+    """Indica se os resultados já trazem o BWE_CV (os gerados antes desta versão não trazem)."""
+    return all("BWE_CV rede" in r["bw_summary"] for r in results)
+
 # carrega (ou recupera do cache) o OCEL e os parâmetros — usados por todas as páginas
 D = load_data(path, KEY)   # tabelas do OCEL (process_mining.OcelData)
 P = load_params(path, KEY)  # parâmetros da simulação (parameters.ModelParameters)
@@ -284,11 +307,11 @@ if page == PAGES[0]:
         ("2 · Mineração", "OC-DFG e Petri net centrada em objetos; achatamento por tipo de objeto, variantes e desempenho."),
         ("3 · Distribuições", "Ajuste (MLE + AIC, teste KS) das durações, quantidades, atributos, nº de ocorrências "
                               "de atividades por objeto, cardinalidades e demanda por ItemLocation."),
-        ("4 · Cenários", "Regras de reposição: Atual (mín–máx), (s,Q), (R,S), (R,s,S) e Lote a Lote."),
+        ("4 · Cenários", "Regras de reposição: Atual (mín–máx), (s,Q), (R,S), (R,s,S), POUT (order-up-to proporcional) e Lote a Lote; sensibilidade à média e à dispersão do lead time."),
         ("5 · Simulação", "Modelo SimPy centrado em objetos (OCPS): processos por tipo de objeto, eventos "
                           "compartilhados, N replicações por cenário com números aleatórios comuns."),
         ("6 · Validação", "O cenário Atual é comparado ao log (frequências, variantes, lead time, efeito chicote)."),
-        ("8 · Comparação", "Efeito chicote (razão de variâncias) por IL, Location, fornecedor e rede, "
+        ("8 · Comparação", "Efeito chicote (razão de variâncias ou coeficiente de variação) por IL, Location, fornecedor e rede, "
                            "nível de serviço e custos, com intervalos de confiança."),
         ("9 · Impacto", "Como um tipo de objeto afeta outro: fornecedor → cliente, reposição → falta, "
                         "demanda → pedidos, lead time → efeito chicote."),
@@ -540,11 +563,12 @@ elif page == PAGES[4]:
             "| **(s, Q) Lote fixo e ponto de pedido** | contínua | IP ≤ s = d̄·L + z·σ_L | Q (EOQ) |\n"
             "| **(R, S) Revisão periódica, intervalo fixo** | a cada R dias | sempre | S − IP, S = F·(L+R) + z·σ_(L+R) |\n"
             "| **(R, s, S) Revisão periódica com ponto de pedido** | a cada R dias | IP ≤ s = F·(L+R) + z·σ_(L+R) | S − IP, S = s + Q |\n"
+            "| **POUT Order-up-to proporcional** | a cada R dias | sempre | F·R + α·(S − IP − F·R), S igual ao da (R, S); α = 1 ⇒ (R, S) |\n"
             "| **Lote a lote** | diária | sempre | necessidade líquida do dia (base-stock fixo ⇒ repõe exatamente o consumido) |\n\n"
             "**F** é a previsão de demanda diária: *estática* (média do log) ou *dinâmica* (média móvel / "
             "suavização exponencial, atualizada todo dia). A previsão dinâmica é um dos mecanismos clássicos do "
             "efeito chicote (Dejonckheere et al., 2003).")
-    # na primeira visita, começa com os 5 cenários padrão
+    # na primeira visita, começa com os cenários padrão (inclui POUT com α = 0,5 e 0,3)
     if "scenarios" not in st.session_state:
         from ocsim.policies import default_scenarios
         st.session_state["scenarios"] = default_scenarios()
@@ -558,26 +582,29 @@ elif page == PAGES[4]:
     b = g[2].number_input("Custo de falta (por un·dia)", 0.0, 1000.0, float(scs[0].backorder_cost), 1.0)
     use_loc = g[3].toggle("Nível de serviço da Location (log)", value=scs[0].service_level is None)
     ns = None if use_loc else st.slider("Nível de serviço alvo", 0.80, 0.995, 0.95, 0.005)
-    g2 = st.columns(3)
-    ltf = g2[0].slider("Fator de lead time (sensibilidade)", 0.25, 2.0, float(scs[0].lead_time_factor), 0.05)
-    dmf = g2[1].slider("Fator de demanda (sensibilidade)", 0.5, 2.0, float(scs[0].demand_factor), 0.05)
-    stag = g2[2].toggle("Revisões escalonadas entre ILs", value=scs[0].staggered_reviews,
+    g2 = st.columns(4)
+    ltf = g2[0].slider("Fator de lead time — média (sensibilidade)", 0.25, 2.0, float(scs[0].lead_time_factor), 0.05)
+    lts = g2[1].slider("Fator de dispersão do lead time", 0.0, 3.0, float(scs[0].lead_time_spread), 0.1,
+                       help="Multiplica só o desvio-padrão do lead time do fornecedor, mantendo a média: "
+                            "LT' = μ + k·(LT − μ). k = 0 → lead time constante; k = 1 → como no log; k = 2 → desvio dobrado.")
+    dmf = g2[2].slider("Fator de demanda (sensibilidade)", 0.5, 2.0, float(scs[0].demand_factor), 0.05)
+    stag = g2[3].toggle("Revisões escalonadas entre ILs", value=scs[0].staggered_reviews,
                         help="Se desligado, todos os ILs revisam no mesmo dia (sincronização aumenta o chicote no fornecedor).")
 
     # um bloco por política: incluir ou não + parâmetros específicos (R, previsão...)
     st.subheader("Cenários")
     new = []
-    for pol in ["ATUAL", "SQ", "RS", "RSS", "L4L"]:
+    for pol in ["ATUAL", "SQ", "RS", "RSS", "POUT", "L4L"]:
         cur = next((s for s in scs if s.policy == pol), ScenarioConfig(policy=pol))
-        with st.expander(POLICY_LABELS[pol], expanded=pol in ("RS", "RSS")):
+        with st.expander(POLICY_LABELS[pol], expanded=pol in ("RS", "RSS", "POUT")):
             c = st.columns(5)
             on = c[0].checkbox("Incluir", value=any(s.policy == pol for s in scs), key=f"on_{pol}")
             R = cur.review_period
             fc = cur.forecast
             acc = cur.backorder_accounting
-            if pol in ("RS", "RSS"):
+            if pol in ("RS", "RSS", "POUT"):
                 R = c[1].number_input("R (dias)", 1, 60, int(cur.review_period), key=f"R_{pol}")
-            if pol in ("SQ", "RS", "RSS"):
+            if pol in ("SQ", "RS", "RSS", "POUT"):
                 fc = c[2].selectbox("Previsão F", ["estatico", "media_movel", "suav_exponencial"],
                                     index=["estatico", "media_movel", "suav_exponencial"].index(cur.forecast),
                                     format_func=lambda x: {"estatico": "estática (log)", "media_movel": "média móvel",
@@ -595,11 +622,21 @@ elif page == PAGES[4]:
                                                             "correta": "física correta"}[x], key="acc_ATUAL")
                 st.caption("No log, o recebimento abate o backorder sem consumir o estoque. 'como no log' reproduz "
                            "isso para validar o simulador; 'física correta' é a contabilidade real.")
+            alphas = [cur.pout_alpha]
+            if pol == "POUT":
+                prev = sorted({s_.pout_alpha for s_ in scs if s_.policy == "POUT"}) or [0.5, 0.3]
+                alphas = c[4].multiselect("α (um cenário por valor)", [1.0, 0.8, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1],
+                                          default=[a for a in prev if a in (1.0, 0.8, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1)],
+                                          key="alpha_POUT")
+                st.caption("Cada α gera um cenário. α = 1 reproduz a (R, S); valores menores suavizam os pedidos "
+                           "(menos chicote) e aumentam a oscilação do estoque (Disney & Towill, 2003).")
             if on:
-                new.append(ScenarioConfig(policy=pol, review_period=int(R), forecast=fc, ma_window=int(ma),
-                                          es_alpha=float(al), service_level=ns, order_cost=K, holding_rate=h,
-                                          backorder_cost=b, lead_time_factor=ltf, demand_factor=dmf,
-                                          staggered_reviews=stag, backorder_accounting=acc))
+                for a_ in (alphas if pol == "POUT" else [cur.pout_alpha]):
+                    new.append(ScenarioConfig(policy=pol, review_period=int(R), forecast=fc, ma_window=int(ma),
+                                              es_alpha=float(al), service_level=ns, order_cost=K, holding_rate=h,
+                                              backorder_cost=b, lead_time_factor=ltf, lead_time_spread=lts,
+                                              demand_factor=dmf, staggered_reviews=stag, backorder_accounting=acc,
+                                              pout_alpha=float(a_)))
     st.session_state["scenarios"] = new   # guarda a escolha para a etapa 5
 
     # prévia: s, S e Q iniciais de cada IL no cenário selecionado
@@ -717,8 +754,12 @@ elif page == PAGES[6]:
                 f"simulado {sim_k['% pedidos de venda com backorder']:.1f}%", delta_color="off", delta_arrow="off")
     c[2].metric("Pedidos de compra — log", lb["kpis"]["nº pedidos de compra"],
                 f"simulado {sim_k['nº pedidos de compra']:.0f}", delta_color="off", delta_arrow="off")
-    bw_sim = np.mean([r["bw_summary"]["BWE rede"] for r in asis])
-    c[3].metric("Efeito chicote (rede) — log", f"{lb['bw']['summary']['BWE rede']:.2f}",
+    if BW == "BWE_CV" and not has_cv(asis):
+        st.warning("Estes resultados foram gerados antes da inclusão do BWE (CV). Execute a simulação "
+                   "novamente na etapa 5.")
+        st.stop()
+    bw_sim = np.mean([r["bw_summary"][f"{BW} rede"] for r in asis])
+    c[3].metric(f"Efeito chicote (rede, {BWM['nome']}) — log", f"{lb['bw']['summary'][f'{BW} rede']:.2f}",
                 f"simulado {bw_sim:.2f}", delta_color="off", delta_arrow="off")
 
     # barras horizontais: nº de eventos por atividade, log × simulado
@@ -763,16 +804,17 @@ elif page == PAGES[6]:
         st.dataframe(pd.DataFrame(rows).round(1), hide_index=True, use_container_width=True)
 
     # dispersão: cada ponto é um IL; perto da diagonal = simulador reproduz o log
-    st.subheader("Efeito chicote por IL — log × simulado (Atual)")
-    lp = lb["bw"]["per_il"][["il", "BWE"]].rename(columns={"BWE": "log"})
-    sp = pd.concat([pd.DataFrame(r["bw_per_il"]) for r in asis]).groupby("il")["BWE"].mean().rename("simulado")
+    st.subheader(f"Efeito chicote por IL ({BWM['nome']}) — log × simulado (Atual)")
+    lp = lb["bw"]["per_il"][["il", BW]].rename(columns={BW: "log"})
+    sp = pd.concat([pd.DataFrame(r["bw_per_il"]) for r in asis]).groupby("il")[BW].mean().rename("simulado")
     m = lp.merge(sp, on="il").dropna()
     fig = go.Figure(go.Scatter(x=m["log"], y=m["simulado"], mode="markers", text=m["il"],
                                marker=dict(size=9, color=SERIES[0], line=dict(color="white", width=1.5)),
                                hovertemplate="%{text}<br>log: %{x:.2f}<br>simulado: %{y:.2f}<extra></extra>"))
     mx = float(np.nanmax([m["log"].max(), m["simulado"].max(), 1]))
     fig.add_trace(go.Scatter(x=[0, mx], y=[0, mx], mode="lines", line=dict(color=MUTED, dash="dot"), name="y = x"))
-    st.plotly_chart(style(fig, 380, xtitle="BWE no log", ytitle="BWE simulado", legend=False), use_container_width=True)
+    st.plotly_chart(style(fig, 380, xtitle=f"{BWS} no log", ytitle=f"{BWS} simulado", legend=False),
+                    use_container_width=True)
 
     st.caption("Para analisar o OCEL simulado com as mesmas técnicas de mineração usadas no log original "
                "(OC-DFG, variantes, desempenho), veja a etapa 7.")
@@ -814,7 +856,7 @@ elif page == PAGES[7]:
         t = pd.concat([a, b], axis=1).fillna(0).sort_values("original", ascending=False)
         fig = go.Figure()
         fig.add_trace(go.Bar(y=t.index, x=t["original"], name="original", orientation="h", marker=dict(color=LOG_COLOR, cornerradius=3)))
-        fig.add_trace(go.Bar(y=t.index, x=t["simulado"], name=f"simulado — {POLICY_SHORT.get(rr['policy'], sc)}",
+        fig.add_trace(go.Bar(y=t.index, x=t["simulado"], name=f"simulado — {short_from_label(sc, rr['policy'])}",
                              orientation="h", marker=dict(color=color_for(rr["policy"]), cornerradius=3)))
         fig.update_xaxes(type="log")
         fig.update_yaxes(autorange="reversed")
@@ -873,11 +915,16 @@ elif page == PAGES[7]:
 # serviço, custo, trade-offs e séries temporais, com IC 95%.
 elif page == PAGES[8]:
     header("Etapa 8", "Comparação de cenários",
-           "Efeito chicote = Var(pedidos ao fornecedor) / Var(demanda do cliente). Valores acima de 1 indicam "
-           "amplificação da variabilidade rumo a montante. Barras mostram a média das replicações e o IC 95%.")
+           f"Efeito chicote ({BWM['nome']}) = {BWM['formula']}. Valores acima de 1 indicam "
+           "amplificação da variabilidade rumo a montante. Barras mostram a média das replicações e o IC 95%. "
+           "A métrica é escolhida na barra lateral.")
     res = st.session_state.get("results")
     if not res:
         st.info("Execute a simulação na etapa 5.")
+        st.stop()
+    if BW == "BWE_CV" and not has_cv(res):
+        st.warning("Estes resultados foram gerados antes da inclusão do BWE (CV). Execute a simulação "
+                   "novamente na etapa 5.")
         st.stop()
     opts = st.session_state["opts"]
     lb = load_log_baseline(path, KEY, opts["warmup_days"], opts["bucket_days"])
@@ -891,23 +938,24 @@ elif page == PAGES[8]:
         rows = []
         for sc in order:
             mm, lo, hi = X.ci95(df.loc[df["cenário"] == sc, col])
-            rows.append({"cenário": POLICY_SHORT.get(pol_of[sc], sc), "full": sc, "m": mm, "lo": lo, "hi": hi})
+            rows.append({"cenário": short_from_label(sc, pol_of[sc]), "full": sc, "m": mm, "lo": lo, "hi": hi})
         return pd.DataFrame(rows)
 
     # ---- KPI tiles: melhor cenário em cada critério
     st.subheader("Resumo")
-    summ = X.summary_table(df, ["BWE rede", "BWE mediano IL", "NSAmp mediano IL", "nível de serviço (fill rate)",
-                                "% pedidos de venda com backorder", "estoque médio (un/IL)", "nº pedidos de compra",
-                                "custo total"])
-    best_bw = summ.loc[summ["BWE rede"].idxmin(), "cenário"]
+    bw_cols = ["BWE rede", "BWE mediano IL"] + (["BWE_CV rede", "BWE_CV mediano IL"] if has_cv(res) else [])
+    summ = X.summary_table(df, bw_cols + ["NSAmp mediano IL", "nível de serviço (fill rate)",
+                                          "% pedidos de venda com backorder", "estoque médio (un/IL)",
+                                          "nº pedidos de compra", "custo total"])
+    best_bw = summ.loc[summ[f"{BW} rede"].idxmin(), "cenário"]
     best_ns = summ.loc[summ["nível de serviço (fill rate)"].idxmax(), "cenário"]
     best_c = summ.loc[summ["custo total"].idxmin(), "cenário"]
     c = st.columns(3)
-    c[0].metric("Menor efeito chicote (rede)", POLICY_SHORT.get(pol_of[best_bw], best_bw),
-                f"BWE {summ['BWE rede'].min():.2f}", delta_color="off", delta_arrow="off")
-    c[1].metric("Maior nível de serviço", POLICY_SHORT.get(pol_of[best_ns], best_ns),
+    c[0].metric("Menor efeito chicote (rede)", short_from_label(best_bw, pol_of[best_bw]),
+                f"{BWS} {summ[f'{BW} rede'].min():.2f}", delta_color="off", delta_arrow="off")
+    c[1].metric("Maior nível de serviço", short_from_label(best_ns, pol_of[best_ns]),
                 f"{summ['nível de serviço (fill rate)'].max():.1%}", delta_color="off", delta_arrow="off")
-    c[2].metric("Menor custo total", POLICY_SHORT.get(pol_of[best_c], best_c),
+    c[2].metric("Menor custo total", short_from_label(best_c, pol_of[best_c]),
                 f"{summ['custo total'].min():,.0f}".replace(",", "."), delta_color="off", delta_arrow="off")
 
     t = st.tabs(["Efeito chicote", "Por nível da cadeia", "Por ItemLocation", "Serviço e custo",
@@ -915,48 +963,67 @@ elif page == PAGES[8]:
     # aba: BWE da rede e mediano por IL + distribuição entre ILs
     with t[0]:
         c1, c2 = st.columns(2)
-        a = agg("BWE rede")
-        c1.plotly_chart(bar_ci(a, "m", "lo", "hi", "cenário", pols, "BWE da rede (todas as ILs)", "BWE",
-                               ref=lb["bw"]["summary"]["BWE rede"]), use_container_width=True)
-        a = agg("BWE mediano IL")
-        c2.plotly_chart(bar_ci(a, "m", "lo", "hi", "cenário", pols, "BWE mediano por ItemLocation", "BWE",
-                               ref=lb["bw"]["summary"]["BWE mediano IL"]), use_container_width=True)
-        st.caption("Linha tracejada: valor medido no log original. Linha pontilhada: BWE = 1 (sem amplificação). "
-                   "O BWE da rede agrega todas as ILs (as flutuações individuais se compensam); o BWE mediano "
-                   "por IL mostra a amplificação em cada elo.")
+        a = agg(f"{BW} rede")
+        c1.plotly_chart(bar_ci(a, "m", "lo", "hi", "cenário", pols, f"{BWS} da rede (todas as ILs)", BWS,
+                               ref=lb["bw"]["summary"][f"{BW} rede"]), use_container_width=True)
+        a = agg(f"{BW} mediano IL")
+        c2.plotly_chart(bar_ci(a, "m", "lo", "hi", "cenário", pols, f"{BWS} mediano por ItemLocation", BWS,
+                               ref=lb["bw"]["summary"][f"{BW} mediano IL"]), use_container_width=True)
+        st.caption(f"Linha tracejada: valor medido no log original. Linha pontilhada: {BWS} = 1 (sem amplificação). "
+                   f"O {BWS} da rede agrega todas as ILs (as flutuações individuais se compensam); o {BWS} mediano "
+                   "por IL mostra a amplificação em cada elo."
+                   + (" O BWE (CV) compara a variabilidade relativa à média de cada série; com médias iguais, "
+                      "BWE (CV) = √BWE — por isso seus valores são menores que os da razão de variâncias."
+                      if BW == "BWE_CV" else ""))
         fig = go.Figure()
         for i, sc in enumerate(order):
-            v = pd.concat([pd.DataFrame(r["bw_per_il"]) for r in res if r["scenario"] == sc])["BWE"].dropna()
-            fig.add_trace(go.Box(y=v, name=POLICY_SHORT.get(pol_of[sc], sc), marker_color=color_for(pol_of[sc], i),
+            v = pd.concat([pd.DataFrame(r["bw_per_il"]) for r in res if r["scenario"] == sc])[BW].dropna()
+            fig.add_trace(go.Box(y=v, name=short_from_label(sc, pol_of[sc]), marker_color=color_for(pol_of[sc], i),
                                  boxpoints="outliers", line=dict(width=1.5)))
-        fig.add_trace(go.Box(y=lb["bw"]["per_il"]["BWE"].dropna(), name="Log original", marker_color=LOG_COLOR))
+        fig.add_trace(go.Box(y=lb["bw"]["per_il"][BW].dropna(), name="Log original", marker_color=LOG_COLOR))
         fig.update_yaxes(type="log")
-        st.plotly_chart(style(fig, 420, "Distribuição do BWE entre ItemLocations (todas as replicações)",
-                              ytitle="BWE (escala log)", legend=False), use_container_width=True)
+        st.plotly_chart(style(fig, 420, f"Distribuição do {BWS} entre ItemLocations (todas as replicações)",
+                              ytitle=f"{BWS} (escala log)", legend=False), use_container_width=True)
+        if has_cv(res):
+            # as duas métricas lado a lado: mostram se o ranking das políticas depende da métrica escolhida
+            st.markdown("**Razão de variâncias × coeficiente de variação** (média das replicações)")
+            both = summ[["cenário", "BWE rede", "BWE_CV rede", "BWE mediano IL", "BWE_CV mediano IL"]].copy()
+            both["cenário"] = [short_from_label(s, pol_of[s]) for s in both["cenário"]]
+            # posição 1 = menor amplificação, só entre os cenários simulados
+            both["posição (BWE rede)"] = both["BWE rede"].rank(method="min").astype("Int64")
+            both["posição (BWE_CV rede)"] = both["BWE_CV rede"].rank(method="min").astype("Int64")
+            log_row = {"cenário": "Log original", **{k: lb["bw"]["summary"][k] for k in
+                                                       ["BWE rede", "BWE_CV rede", "BWE mediano IL", "BWE_CV mediano IL"]}}
+            both = pd.concat([both, pd.DataFrame([log_row])], ignore_index=True)
+            st.dataframe(both.round(3), use_container_width=True, hide_index=True)
+            st.caption("Se as posições diferem entre as duas colunas, a escolha da métrica muda a conclusão sobre "
+                       "qual política amplifica menos — em geral porque a média dos pedidos se afasta da média da "
+                       "demanda (recebimento parcial, transição, ajustes).")
     # aba: BWE por nível de agregação (Location, fornecedor, rede)
     with t[1]:
-        lv = pd.DataFrame([{"cenário": POLICY_SHORT.get(r["policy"], r["scenario"]), "policy": r["policy"], **r["bw_levels"]}
-                           for r in res])
+        lv = pd.DataFrame([{"cenário": short_from_label(r["scenario"], r["policy"]), "policy": r["policy"],
+                            **r[BWM["res_levels"]]} for r in res])
         levels = [c_ for c_ in lv.columns if c_ not in ("cenário", "policy")]
         mean = lv.groupby(["cenário", "policy"], sort=False)[levels].mean().reset_index()
         fig = go.Figure()
         for i, (_, r) in enumerate(mean.iterrows()):
             fig.add_trace(go.Bar(x=levels, y=[r[l_] for l_ in levels], name=r["cenário"],
                                  marker=dict(color=color_for(r["policy"], i), cornerradius=3)))
-        fig.add_trace(go.Scatter(x=levels, y=[lb["bw"]["levels"].get(l_, np.nan) for l_ in levels], mode="markers",
+        fig.add_trace(go.Scatter(x=levels, y=[lb["bw"][BWM["levels"]].get(l_, np.nan) for l_ in levels], mode="markers",
                                  name="Log original", marker=dict(symbol="line-ew", size=26, color=LOG_COLOR,
                                                               line=dict(width=3, color=LOG_COLOR))))
         fig.update_yaxes(type="log")
-        st.plotly_chart(style(fig, 440, "BWE por nível de agregação", ytitle="BWE (escala log)"),
+        st.plotly_chart(style(fig, 440, f"{BWS} por nível de agregação", ytitle=f"{BWS} (escala log)"),
                         use_container_width=True)
         st.caption("Location: soma das ILs de cada armazém. Fornecedor: pedidos recebidos pelo fornecedor ÷ "
                    "demanda final das ILs que ele atende.")
     # aba: tabela de BWE de cada IL em cada cenário
     with t[2]:
-        per = pd.concat([pd.DataFrame(r["bw_per_il"]).assign(cenário=POLICY_SHORT.get(r["policy"], r["scenario"]))
+        per = pd.concat([pd.DataFrame(r["bw_per_il"]).assign(cenário=short_from_label(r["scenario"], r["policy"]))
                          for r in res])
-        piv = per.groupby(["il", "cenário"])["BWE"].mean().unstack()[[POLICY_SHORT.get(p, p) for p in pols]]
-        piv["Log original"] = lb["bw"]["per_il"].set_index("il")["BWE"]
+        st.caption(f"Valores de {BWS} ({BWM['nome']}) por IL, média das replicações.")
+        piv = per.groupby(["il", "cenário"])[BW].mean().unstack()[[short_from_label(s_, pol_of[s_]) for s_ in order]]
+        piv["Log original"] = lb["bw"]["per_il"].set_index("il")[BW]
         info = pd.DataFrame({il: {"classe": ip.material_class, "location": ip.location,
                                   "demanda/dia": ip.daily_mean} for il, ip in P.item_locations.items()}).T
         st.dataframe(info.join(piv).round(2), use_container_width=True, height=500)
@@ -980,14 +1047,14 @@ elif page == PAGES[8]:
         fig = go.Figure()
         for i, sc in enumerate(order):
             g_ = df[df["cenário"] == sc]
-            fig.add_trace(go.Scatter(x=g_["BWE rede"], y=g_["nível de serviço (fill rate)"], mode="markers",
-                                     name=POLICY_SHORT.get(pol_of[sc], sc),
+            fig.add_trace(go.Scatter(x=g_[f"{BW} rede"], y=g_["nível de serviço (fill rate)"], mode="markers",
+                                     name=short_from_label(sc, pol_of[sc]),
                                      marker=dict(size=10, color=color_for(pol_of[sc], i), line=dict(color="white", width=1.5))))
-        st.plotly_chart(style(fig, 400, xtitle="BWE da rede", ytitle="fill rate"), use_container_width=True)
+        st.plotly_chart(style(fig, 400, xtitle=f"{BWS} da rede", ytitle="fill rate"), use_container_width=True)
     # aba: séries semanais de demanda × pedidos (o chicote "visível") e estoque líquido
     with t[4]:
         c1, c2 = st.columns([1, 1])
-        sc = c1.selectbox("Cenário", order, format_func=lambda s: POLICY_SHORT.get(pol_of[s], s))
+        sc = c1.selectbox("Cenário", order, format_func=lambda s: short_from_label(s, pol_of[s]))
         il_opt = ["Rede (total)"] + list(P.item_locations)
         il = c2.selectbox("ItemLocation", il_opt)
         r0 = next(r for r in res if r["scenario"] == sc and r["rep"] == 0)
@@ -998,7 +1065,7 @@ elif page == PAGES[8]:
         fig.add_trace(go.Scatter(y=wd, mode="lines", name="demanda do cliente", line=dict(color=LOG_COLOR, width=2)))
         fig.add_trace(go.Scatter(y=wo, mode="lines", name="pedidos ao fornecedor",
                                  line=dict(color=color_for(pol_of[sc]), width=2)))
-        st.plotly_chart(style(fig, 380, f"Semanal — {il} — {POLICY_SHORT.get(pol_of[sc], sc)} (replicação 1)",
+        st.plotly_chart(style(fig, 380, f"Semanal — {il} — {short_from_label(sc, pol_of[sc])} (replicação 1)",
                               xtitle="semana", ytitle="unidades"), use_container_width=True)
         ns = r0["daily_net_stock"].sum(0) if idx is None else r0["daily_net_stock"][idx]
         fig = go.Figure(go.Scatter(y=ns, mode="lines", name="estoque líquido", line=dict(color=color_for(pol_of[sc]), width=2)))
@@ -1037,7 +1104,7 @@ elif page == PAGES[9]:
     for rr in res:
         if rr.get("ocel_json"):
             sp, sk = simulated_ocel_path(rr)
-            sources[f"Simulado — {POLICY_SHORT.get(rr['policy'], rr['scenario'])}"] = (sp, sk, rr["policy"])
+            sources[f"Simulado — {short_from_label(rr['scenario'], rr['policy'])}"] = (sp, sk, rr["policy"])
     if len(sources) == 1:
         st.info("Por enquanto só o log original está disponível. Para comparar com logs simulados, escolha "
                 "cenários em “Gerar OCEL simulado” na etapa 5 e execute a simulação.")
@@ -1141,7 +1208,7 @@ elif page == PAGES[9]:
                 reps = [r for r in res if r["scenario"] == sc]
                 curves = [IMP.lagged_response(r["weekly_demand"], r["weekly_orders"])[level].to_numpy() for r in reps]
                 fig.add_trace(go.Scatter(x=lr["defasagem (semanas)"], y=np.nanmean(curves, axis=0),
-                                         mode="lines+markers", name=POLICY_SHORT.get(reps[0]["policy"], sc),
+                                         mode="lines+markers", name=short_from_label(sc, reps[0]["policy"]),
                                          line=dict(color=color_for(reps[0]["policy"], i), width=2)))
         else:
             st.info("Execute a simulação (etapa 5) para comparar as políticas.")
@@ -1154,14 +1221,20 @@ elif page == PAGES[9]:
         st.markdown(
             "**Pergunta:** quanto o comportamento do **Supplier** (lead time) muda o efeito chicote e o serviço dos "
             "**ItemLocation**? Aqui o simulador funciona como experimento controlado: só o lead time do fornecedor "
-            "muda (multiplicado pelo fator), todo o resto fica igual (mesmas sementes).")
+            "muda, todo o resto fica igual (mesmas sementes). Pode-se variar a **média** do lead time (fator que "
+            "multiplica o lead time) ou só a sua **dispersão** (fator que multiplica o desvio-padrão, mantendo a média).")
+        what = st.radio("O que variar", ["média", "dispersão"], horizontal=True, key="sens_what",
+                        format_func=lambda x: {"média": "média do lead time", "dispersão": "dispersão do lead time"}[x])
+        fld = "lead_time_factor" if what == "média" else "lead_time_spread"
+        xlab = "fator do lead time do fornecedor" if what == "média" else "fator de dispersão do lead time"
         scs = st.session_state.get("scenarios")
         if not scs:
             from ocsim.policies import default_scenarios
             scs = default_scenarios()
         c = st.columns(3)
-        factors = c[0].multiselect("Fatores de lead time", [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0],
-                                   default=[0.5, 1.0, 1.5, 2.0])
+        opts_f = [0.25, 0.5, 0.75, 1.0, 1.25, 1.5, 2.0] if what == "média" else [0.0, 0.5, 1.0, 1.5, 2.0, 3.0]
+        factors = c[0].multiselect("Fatores", opts_f, default=[0.5, 1.0, 1.5, 2.0] if what == "média" else [0.0, 1.0, 2.0, 3.0],
+                                   key=f"factors_{what}")
         n_rep = c[1].number_input("Replicações por ponto", 1, 50, 3)
         par = c[2].toggle("Usar vários núcleos", X.parallel_supported(), key="par_sens")
         st.caption(f"{len(factors) * len(scs) * n_rep} replicações no total.")
@@ -1170,7 +1243,7 @@ elif page == PAGES[9]:
             out = []
             for j, f in enumerate(sorted(factors)):
                 # cópia de cada cenário, mudando apenas o fator de lead time
-                sc_f = [dataclasses.replace(sc, lead_time_factor=float(f)) for sc in scs]
+                sc_f = [dataclasses.replace(sc, **{fld: float(f)}) for sc in scs]
                 rr = X.run_experiment(P, sc_f, int(n_rep), 42, {"warmup_days": 56, "bucket_days": 7},
                                       parallel=par,
                                       progress=lambda fr, m, j=j: bar.progress(min((j + fr) / len(factors), 1.0),
@@ -1179,23 +1252,26 @@ elif page == PAGES[9]:
                 dfr["fator de lead time"] = f
                 out.append(dfr)
             st.session_state["sens"] = pd.concat(out)
+            st.session_state["sens_xlab"] = xlab
             bar.progress(1.0, "Concluído")
         sens = st.session_state.get("sens")
         if sens is not None:
+            bw_s = BW if f"{BW} rede" in sens.columns else "BWE"   # sensibilidade rodada antes desta versão
             c1, c2 = st.columns(2)
-            for col, metric, ttl in [(c1, "BWE rede", "Efeito chicote da rede"),
+            for col, metric, ttl in [(c1, f"{bw_s} rede", f"Efeito chicote da rede ({BW_METRICS[bw_s]['nome']})"),
                                      (c2, "nível de serviço (fill rate)", "Nível de serviço (fill rate)")]:
                 fig = go.Figure()
                 for i, (sc, g) in enumerate(sens.groupby("cenário", sort=False)):
                     m = g.groupby("fator de lead time")[metric].mean()
                     pol = g["política"].iloc[0]
                     fig.add_trace(go.Scatter(x=m.index, y=m.values, mode="lines+markers",
-                                             name=POLICY_SHORT.get(pol, sc),
+                                             name=short_from_label(sc, pol),
                                              line=dict(color=color_for(pol, i), width=2), marker=dict(size=8)))
-                col.plotly_chart(style(fig, 380, ttl, xtitle="fator do lead time do fornecedor", ytitle=metric),
+                col.plotly_chart(style(fig, 380, ttl, xtitle=st.session_state.get("sens_xlab", "fator do lead time do fornecedor"), ytitle=metric),
                                  use_container_width=True)
             st.dataframe(sens.groupby(["cenário", "fator de lead time"], sort=False)[
-                ["BWE rede", "BWE mediano IL", "nível de serviço (fill rate)", "custo total"]].mean().round(3),
+                [c_ for c_ in ["BWE rede", "BWE mediano IL", "BWE_CV rede", "BWE_CV mediano IL",
+                               "nível de serviço (fill rate)", "custo total"] if c_ in sens.columns]].mean().round(3),
                 use_container_width=True)
 
 # ===================================================================== 10
