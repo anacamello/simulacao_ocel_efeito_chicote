@@ -106,11 +106,13 @@ def run_replication(cfg_dict: dict, seed: int, rep: int, opts: dict, params: Mod
     res = {
         "scenario": cfg.label(),
         "policy": cfg.policy,
+        "short": cfg.short_label(),       # nome curto (distingue POUTs com α diferentes)
         "rep": rep,
         "seed": seed,
         "kpis": k,
         "bw_summary": bw["summary"],
         "bw_levels": bw["levels"],
+        "bw_levels_cv": bw["levels_cv"],
         "bw_per_il": bw["per_il"].to_dict("records"),
         "counts": dict(sim.counts),              # eventos por atividade (validação)
         "obj_counts": dict(sim.obj_counts),      # objetos criados por tipo
@@ -300,6 +302,7 @@ def results_frame(results: list[dict]) -> pd.DataFrame:
         row = {"cenário": r["scenario"], "política": r["policy"], "replicação": r["rep"]}
         row.update(r["bw_summary"])
         row.update({f"BWE {k}": v for k, v in r["bw_levels"].items() if not k.startswith("Rede")})
+        row.update({f"BWE_CV {k}": v for k, v in r.get("bw_levels_cv", {}).items() if not k.startswith("Rede")})
         row.update(r["kpis"])
         rows.append(row)
     return pd.DataFrame(rows)
