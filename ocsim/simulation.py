@@ -71,7 +71,7 @@ import pandas as pd
 import simpy
 
 from .parameters import ModelParameters, ILParams
-from .policies import ScenarioConfig, PolicyState, make_policy_state
+from .policies import ScenarioConfig, PolicyState, make_policy_state, spread_lead_time
 
 REVIEW_HOUR = 17.5 / 24  # hora padrão da revisão (17h30) se não houver distribuição no log
 
@@ -457,7 +457,7 @@ class SupplyChainSimulation:
         cfg = self.cfg
         tod = self.P.time_of_day.get("Replenishment Proposal Created")
         # intervalo de revisão: diário para Atual, L4L e (s,Q); R dias para RS e RSS
-        R = 1 if cfg.policy in ("ATUAL", "L4L", "SQ") else max(1, int(cfg.review_period))
+        R = 1 if cfg.policy in ("ATUAL", "L4L", "SQ") else max(1, int(cfg.review_period))  # RS, RSS e POUT: R dias
         # revisões escalonadas: cada IL revisa num dia diferente do ciclo de R dias
         offset = (self.il_index[st.p.il] % R) if (cfg.staggered_reviews and R > 1) else 0
         day = 0
@@ -487,6 +487,11 @@ class SupplyChainSimulation:
                     if cfg.policy == "RS":
                         # sempre pede até S
                         q = st.pol.round_qty(st.pol.S - st.ip)
+                        if q > 0:
+                            self.place_order(st, q, "periodic review")
+                    elif cfg.policy == "POUT":
+                        # pede F·R + α·(S − IP − F·R): fecha só a fração α da diferença
+                        q = st.pol.round_qty(st.pol.pout_qty(st.ip))
                         if q > 0:
                             self.place_order(st, q, "periodic review")
                     elif cfg.policy == "RSS":
@@ -556,7 +561,9 @@ class SupplyChainSimulation:
         arr[dday] += qty
         # lead time do fornecedor (PO criado → recebimento)
         lt_dist = P.supplier_lead_time.get(sup, P.supplier_lead_time["__all__"])
-        lt = max(0.0, float(lt_dist.sample(self.rng, self.mode))) * self.cfg.lead_time_factor
+        # dispersão (k) aplicada em torno da média da distribuição; depois o fator de média
+        lt = spread_lead_time(float(lt_dist.sample(self.rng, self.mode)), lt_dist,
+                              self.cfg.lead_time_spread) * self.cfg.lead_time_factor
         created = env.now
         self.add_object(po, "PurchaseOrderItem", {
             "ordered_quantity": qty, "confirmed_quantity": qty,
@@ -692,7 +699,7 @@ class SupplyChainSimulation:
         # "amostragem por rejeição": sorteia lead times até sair um maior que a
         # idade do pedido (no máximo 200 tentativas)
         for _ in range(200):
-            x = float(dist.sample(self.rng, self.mode))
+            x = spread_lead_time(float(dist.sample(self.rng, self.mode)), dist, self.cfg.lead_time_spread)
             if x > age:
                 lt = x
                 break
