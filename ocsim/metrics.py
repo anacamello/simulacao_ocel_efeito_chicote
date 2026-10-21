@@ -24,6 +24,19 @@ carrega o efeito do estado inicial. O BWE é calculado em 4 níveis:
   - por Fornecedor (pedidos que o fornecedor recebe ÷ demanda final que ele atende);
   - para a rede inteira (soma de tudo).
 
+EFEITO CHICOTE pelo COEFICIENTE DE VARIAÇÃO (BWE_CV)
+---------------------------------------------------
+    BWE_CV = CV(pedidos) / CV(demanda),   com CV = desvio-padrão / média
+
+(Fransoo & Wouters, 2000). Compara a variabilidade RELATIVA à média de cada
+série, por isso não é distorcida quando a média dos pedidos difere da média da
+demanda — ex.: recebimento parcial, perdas, ajustes de inventário ou o efeito
+de transição no curto prazo. Interpretação igual à da razão de variâncias
+(> 1 = amplificação). Quando as médias são iguais, BWE_CV = √BWE; por isso
+seus valores tendem a ser menores, e as duas métricas não devem ser
+comparadas diretamente entre si, só cada uma entre cenários.
+É calculado nos mesmos 4 níveis e com os mesmos baldes e aquecimento.
+
 Também se calcula a amplificação do estoque líquido
 (NSAmp, Disney & Towill, 2003) = Var(estoque líquido) / Var(demanda).
 """
@@ -57,6 +70,25 @@ def _ratio(num: np.ndarray, den: np.ndarray) -> float:
     return float(np.var(num, ddof=1) / vd)
 
 
+def cv(x: np.ndarray) -> float:
+    """Coeficiente de variação amostral: desvio-padrão (ddof=1) / média.
+    NaN quando a média é ~0 (série sem movimento): o CV não está definido."""
+    x = np.asarray(x, dtype=float)
+    m = x.mean() if x.size else 0.0
+    if x.size < 2 or abs(m) <= 1e-12:
+        return np.nan
+    return float(np.std(x, ddof=1) / m)
+
+
+def _cv_ratio(num: np.ndarray, den: np.ndarray) -> float:
+    """Razão de coeficientes de variação CV(num) / CV(den).
+    NaN se algum CV for indefinido ou se a demanda não variar (CV = 0)."""
+    cn, cd = cv(num), cv(den)
+    if not (np.isfinite(cn) and np.isfinite(cd)) or cd <= 1e-12:
+        return np.nan
+    return float(cn / cd)
+
+
 def bullwhip(
     demand: np.ndarray,
     orders: np.ndarray,
@@ -79,7 +111,8 @@ def bullwhip(
     net_stock          : matriz IL × dia do estoque líquido (para o NSAmp)
     min_weekly_demand  : ILs com demanda média menor que isso ficam fora (razão instável)
 
-    Retorna {"per_il": tabela por IL, "levels": BWE por nível, "summary": resumo}."""
+    Retorna {"per_il": tabela por IL, "levels": BWE por nível,
+             "levels_cv": BWE_CV por nível, "summary": resumo (as duas métricas)}."""
     # 1) descarta o aquecimento e agrega em baldes
     w0 = warmup_days
     D = bucket(demand[:, w0:], bucket_days)
@@ -89,13 +122,18 @@ def bullwhip(
     rows = []
     for i, il in enumerate(ils):
         md = D[i].mean()
+        ok = md >= min_weekly_demand
         r = {
             "il": il,
             "location": il_location.get(il),
             "demanda média/sem": md,
+            "pedidos média/sem": O[i].mean(),
             "var demanda": np.var(D[i], ddof=1),
             "var pedidos": np.var(O[i], ddof=1),
-            "BWE": _ratio(O[i], D[i]) if md >= min_weekly_demand else np.nan,
+            "CV demanda": cv(D[i]),
+            "CV pedidos": cv(O[i]),
+            "BWE": _ratio(O[i], D[i]) if ok else np.nan,
+            "BWE_CV": _cv_ratio(O[i], D[i]) if ok else np.nan,
         }
         if net_stock is not None:
             ns = net_stock[i, w0:]
@@ -105,9 +143,11 @@ def bullwhip(
 
     # 3) BWE agregado: rede inteira e por Location
     levels = {"Rede (total)": _ratio(O.sum(0), D.sum(0))}
+    levels_cv = {"Rede (total)": _cv_ratio(O.sum(0), D.sum(0))}
     for loc in sorted(set(il_location.values())):
         idx = [i for i, il in enumerate(ils) if il_location.get(il) == loc]
         levels[f"Location {loc}"] = _ratio(O[idx].sum(0), D[idx].sum(0))
+        levels_cv[f"Location {loc}"] = _cv_ratio(O[idx].sum(0), D[idx].sum(0))
 
     # 4) BWE por fornecedor: pedidos recebidos ÷ demanda final ponderada pela
     #    proporção de cada IL atendida por esse fornecedor
@@ -117,19 +157,21 @@ def bullwhip(
             if so.sum() > 0 and len(so) == D.shape[1]:
                 w = np.array([(il_supplier_probs or {}).get(il, {}).get(sup, 0.0) for il in ils])
                 if w.sum() >= 1.0:  # ignora fornecedores marginais (atendem menos de 1 IL inteiro)
-                    levels[f"Fornecedor {sup}"] = _ratio(so, (D * w[:, None]).sum(0))
+                    dsup = (D * w[:, None]).sum(0)
+                    levels[f"Fornecedor {sup}"] = _ratio(so, dsup)
+                    levels_cv[f"Fornecedor {sup}"] = _cv_ratio(so, dsup)
 
-    # 5) resumo
-    valid = per_il["BWE"].dropna()
-    summary = {
-        "BWE rede": levels["Rede (total)"],
-        "BWE médio IL": float(valid.mean()) if len(valid) else np.nan,
-        "BWE mediano IL": float(valid.median()) if len(valid) else np.nan,
-        "% IL com BWE>1": float((valid > 1).mean() * 100) if len(valid) else np.nan,
-    }
+    # 5) resumo — as duas métricas, com os mesmos agregados
+    summary = {}
+    for col, lv in (("BWE", levels), ("BWE_CV", levels_cv)):
+        valid = per_il[col].dropna()
+        summary[f"{col} rede"] = lv["Rede (total)"]
+        summary[f"{col} médio IL"] = float(valid.mean()) if len(valid) else np.nan
+        summary[f"{col} mediano IL"] = float(valid.median()) if len(valid) else np.nan
+        summary[f"% IL com {col}>1"] = float((valid > 1).mean() * 100) if len(valid) else np.nan
     if net_stock is not None:
         summary["NSAmp mediano IL"] = float(per_il["NSAmp"].dropna().median())
-    return {"per_il": per_il, "levels": levels, "summary": summary}
+    return {"per_il": per_il, "levels": levels, "levels_cv": levels_cv, "summary": summary}
 
 
 def kpis(sim, params, cfg, warmup_days: int = 56) -> dict:
