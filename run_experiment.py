@@ -16,6 +16,7 @@ Arquivos gerados em --out:
   validacao_atual_vs_log.csv    – frequência das atividades: log × cenário Atual
 """
 import argparse
+import dataclasses
 import os
 from pathlib import Path
 
@@ -37,6 +38,8 @@ def main():
     ap.add_argument("--bucket", type=int, default=7, help="agregação do efeito chicote (dias)")
     ap.add_argument("--sampling", choices=["parametric", "empirical"], default="parametric",
                     help="parametric = distribuições ajustadas; empirical = reamostragem do log")
+    ap.add_argument("--lt-spread", type=float, default=1.0,
+                    help="fator de dispersão do lead time (1 = como no log; 0 = constante; 2 = desvio dobrado)")
     ap.add_argument("--no-parallel", action="store_true", help="desliga o uso de vários núcleos")
     ap.add_argument("--out", default="resultados", help="pasta de saída")
     a = ap.parse_args()
@@ -53,9 +56,9 @@ def main():
     P = extract_parameters(d, progress=lambda m: print("   ", m))
     P.delay_table().to_csv(out / "distribuicoes_duracoes.csv", index=False)
 
-    # 3) simulação dos 5 cenários padrão (etapas 4 e 5)
+    # 3) simulação dos cenários padrão, incluindo POUT α = 0,5 e 0,3 (etapas 4 e 5)
     print("3/4 Simulando…")
-    scs = default_scenarios()
+    scs = [dataclasses.replace(sc, lead_time_spread=a.lt_spread) for sc in default_scenarios()]
     opts = {"warmup_days": a.warmup, "bucket_days": a.bucket, "sampling_mode": a.sampling}
     res = X.run_experiment(P, scs, a.reps, a.seed, opts, parallel=not a.no_parallel,
                            progress=lambda f, m: print(f"   {m}", end="\r"))
@@ -65,13 +68,15 @@ def main():
     print("4/4 Resumo")
     df = X.results_frame(res)
     df.to_csv(out / "resultados_replicacoes.csv", index=False)
-    cols = ["BWE rede", "BWE mediano IL", "nível de serviço (fill rate)", "estoque médio (un/IL)", "custo total"]
+    cols = ["BWE rede", "BWE mediano IL", "BWE_CV rede", "BWE_CV mediano IL",
+            "nível de serviço (fill rate)", "estoque médio (un/IL)", "custo total"]
     summ = X.summary_table(df, cols)
     summ.to_csv(out / "resumo_cenarios.csv", index=False)
     lb = X.log_baseline(d, P, a.warmup, a.bucket)
     print(summ[["cenário"] + cols].round(3).to_string(index=False))
-    print(f"\nLog original: BWE rede = {lb['bw']['summary']['BWE rede']:.3f}; "
-          f"BWE mediano IL = {lb['bw']['summary']['BWE mediano IL']:.3f}")
+    s = lb["bw"]["summary"]
+    print(f"\nLog original: BWE rede = {s['BWE rede']:.3f}; BWE mediano IL = {s['BWE mediano IL']:.3f}; "
+          f"BWE_CV rede = {s['BWE_CV rede']:.3f}; BWE_CV mediano IL = {s['BWE_CV mediano IL']:.3f}")
     X.validation_table(lb, [r for r in res if r["policy"] == "ATUAL"]).to_csv(out / "validacao_atual_vs_log.csv", index=False)
     print(f"Arquivos salvos em {out.resolve()}")
 
