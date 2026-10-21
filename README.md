@@ -32,7 +32,7 @@ O diagrama é gerado com Graphviz a partir de `assets/fluxo.dot` (`dot -Tpng -Gd
 | 5 · Simulação | modelo SimPy centrado em objetos, N replicações (escolhidas pelo usuário) | `ocsim/simulation.py`, `ocsim/experiment.py` |
 | 6 · Validação | cenário Atual × log (frequências, variantes, lead time, efeito chicote) | `ocsim/experiment.py` |
 | 7 · Visão unificada | OCEL simulado minerado com PM4Py lado a lado com o original (atividades/dia, variantes, DFG de desempenho, OC-DFG, modelo de objetos) | `app.py` |
-| 8 · Comparação | efeito chicote por IL / Location / fornecedor / rede, serviço e custos, IC 95% | `ocsim/metrics.py` |
+| 8 · Comparação | efeito chicote (razão de variâncias ou coeficiente de variação) por IL / Location / fornecedor / rede, serviço e custos, IC 95% | `ocsim/metrics.py` |
 | 9 · Impacto entre objetos | fornecedor → cliente, reposição → falta de estoque, demanda → pedidos (correlação defasada) e sensibilidade do BWE ao lead time; log original × simulados | `ocsim/impact.py` |
 | 10 · Exportar | CSVs e OCEL simulado (mesmo esquema do original) | — |
 
@@ -67,10 +67,29 @@ O diagrama é gerado com Graphviz a partir de `assets/fluxo.dot` (`dot -Tpng -Gd
 * **Revisão Periódica com Intervalo Fixo (R, S)** — *order-up-to*, previsão por média móvel (padrão).
 * **Revisão Periódica com Intervalo Fixo e Ponto de Pedido (R, s, S)** — o pedido listava “Revisão Periódica com
   Intervalo Fixo” duas vezes; a segunda foi interpretada como a variante com ponto de pedido.
+* **Order-Up-To Proporcional (POUT)** — revisão periódica como a (R, S), mas a cada R dias pede
+  F·R + α·(S − IP − F·R): corrige só a fração α da diferença até o nível-alvo (Disney & Towill, 2003).
+  α = 1 reproduz a (R, S); α < 1 suaviza os pedidos. Na interface, cada α escolhido vira um cenário
+  (padrão: α = 0,5 e 0,3).
 * **Lote a Lote** — revisão diária, repõe exatamente a necessidade líquida do período.
 
-**Efeito chicote** = Var(pedidos ao fornecedor) / Var(demanda do cliente), em baldes semanais (configurável),
-descartando um período de aquecimento. Também é calculado o NSAmp (variância do estoque líquido / variância da demanda).
+**Sensibilidade do lead time** — além do fator que multiplica a média do lead time, há um fator de
+**dispersão**: LT' = μ + k·(LT − μ), que mantém a média minerada e multiplica o desvio-padrão por k
+(k = 0 → lead time constante; k = 1 → como no log). O estoque de segurança usa o σ_L ajustado.
+A etapa 9 permite variar a média ou a dispersão.
+
+**Efeito chicote** — duas métricas, calculadas sempre e nos mesmos níveis (IL, Location, fornecedor, rede),
+em baldes semanais (configurável), descartando um período de aquecimento:
+
+* **BWE (razão de variâncias)** = Var(pedidos ao fornecedor) / Var(demanda do cliente) — Chen et al. (2000);
+* **BWE_CV (coeficiente de variação)** = CV(pedidos) / CV(demanda), com CV = desvio-padrão / média —
+  Fransoo & Wouters (2000). Mede a variabilidade relativa à média de cada série e não é distorcida quando a
+  média dos pedidos difere da média da demanda (recebimento parcial ≈ 0,84, transição de política, ajustes).
+  Com médias iguais, BWE_CV = √BWE.
+
+Na interface, a métrica exibida nas etapas 6, 8 e 9 é escolhida na barra lateral; a etapa 8 traz também uma
+tabela com as duas métricas e a posição de cada política em cada uma. Os CSVs exportados trazem as duas.
+Também é calculado o NSAmp (variância do estoque líquido / variância da demanda).
 
 ## Observações sobre os dados
 
