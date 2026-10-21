@@ -35,6 +35,13 @@ CENÁRIOS
         Dejonckheere et al. (2003) mostram amplificar a variância dos pedidos.
 * RSS – Revisão Periódica com Intervalo Fixo e Ponto de Pedido (R, s, S):
         a cada R dias, SE IP ≤ s, pede S − IP;  s = F·(L+R)+z·σ_(L+R), S = s + Q.
+* POUT – Revisão Periódica com Order-Up-To Proporcional (Disney & Towill, 2003):
+        a cada R dias pede  F·R + α·(S − IP − F·R),  com S igual ao da (R, S).
+        Em vez de fechar de uma vez toda a diferença até S, fecha só uma fração
+        α dela (0 < α ≤ 1). α = 1 reproduz exatamente a (R, S); α < 1 suaviza
+        os pedidos (menos chicote), à custa de oscilação maior no estoque.
+        O termo F·R é a demanda esperada até a próxima revisão: sem ele, a
+        política pediria menos do que o consumo e o estoque cairia sempre.
 * L4L – Lote a Lote: revisão diária, pede exatamente a necessidade líquida do
         dia (base-stock fixo ⇒ em regime repõe o que foi consumido, sem lote).
 
@@ -44,6 +51,15 @@ e o estoque de segurança é z·σ_T. T é o "período de proteção": o tempo q
 o estoque precisa aguentar até o próximo pedido chegar (L na revisão
 contínua; L + R na revisão periódica, pois o próximo pedido só sai daqui a R
 dias).
+
+DISPERSÃO DO LEAD TIME (lead_time_spread)
+-----------------------------------------
+Além de multiplicar a média (lead_time_factor), é possível mudar só a
+variabilidade do lead time do fornecedor, mantendo a média minerada:
+        LT' = μ + k·(LT − μ)       (k = lead_time_spread; LT' ≥ 0)
+k = 1 usa a distribuição do log; k = 0 torna o lead time constante (= μ);
+k = 2 dobra o desvio-padrão. Os planejadores "sabem" da nova variabilidade:
+o σ_L do estoque de segurança também é multiplicado por k.
 
 Termos de programação (dataclass, dicionário...) estão no glossário de
 ocsim/__init__.py.
@@ -65,11 +81,27 @@ POLICY_LABELS = {
     "SQ": "Lote Fixo e Ponto de Pedido (s, Q)",
     "RS": "Revisão Periódica com Intervalo Fixo (R, S)",
     "RSS": "Revisão Periódica com Intervalo Fixo e Ponto de Pedido (R, s, S)",
+    "POUT": "Revisão Periódica com Order-Up-To Proporcional (POUT)",
     "L4L": "Lote a Lote (L4L)",
 }
 
 # nomes curtos (eixos dos gráficos)
-POLICY_SHORT = {"ATUAL": "Atual", "SQ": "(s,Q)", "RS": "(R,S)", "RSS": "(R,s,S)", "L4L": "Lote a lote"}
+POLICY_SHORT = {"ATUAL": "Atual", "SQ": "(s,Q)", "RS": "(R,S)", "RSS": "(R,s,S)", "POUT": "POUT", "L4L": "Lote a lote"}
+# políticas de revisão periódica (pedem a cada R dias)
+PERIODIC = ("RS", "RSS", "POUT")
+
+
+def _fmt_alpha(a: float) -> str:
+    """α com vírgula decimal e sem zeros sobrando (0,5 / 0,25 / 1)."""
+    return f"{a:g}".replace(".", ",")
+
+
+def short_from_label(label: str, policy: str) -> str:
+    """Nome curto de um cenário para gráficos. Para a POUT inclui o α, pois
+    pode haver vários cenários POUT com α diferentes na mesma rodada."""
+    if policy == "POUT" and "α = " in label:
+        return "POUT α=" + label.split("α = ")[1].rstrip(")")
+    return POLICY_SHORT.get(policy, label)
 
 
 # ===========================================================================
@@ -88,6 +120,8 @@ class ScenarioConfig:
     holding_rate: float = 0.25          # h: custo de estocagem (fração do custo unitário por ano)
     backorder_cost: float = 5.0         # custo por unidade·dia em falta
     lead_time_factor: float = 1.0       # sensibilidade: multiplica o lead time
+    lead_time_spread: float = 1.0       # sensibilidade: multiplica só a dispersão do lead time (média mantida)
+    pout_alpha: float = 0.5             # α da POUT: fração da diferença até S fechada a cada revisão (0 < α ≤ 1)
     demand_factor: float = 1.0          # sensibilidade: multiplica a demanda
     include_lt_variance: bool = True    # incluir a variabilidade do lead time no estoque de segurança
     round_to_lot: bool = True           # arredondar pedidos ao lot_size
@@ -96,7 +130,14 @@ class ScenarioConfig:
     partial_receipts: bool = True       # recebimento parcial conforme a razão recebido/pedido do log
 
     def label(self) -> str:
-        return self.name or POLICY_LABELS.get(self.policy, self.policy)
+        if self.name:
+            return self.name
+        if self.policy == "POUT":
+            return f"{POLICY_LABELS['POUT']} (α = {_fmt_alpha(self.pout_alpha)})"
+        return POLICY_LABELS.get(self.policy, self.policy)
+
+    def short_label(self) -> str:
+        return short_from_label(self.label(), self.policy)
 
     def to_dict(self) -> dict:
         """Converte a ficha em dicionário {campo: valor}.
@@ -168,10 +209,11 @@ class PolicyState:
             # período de proteção = L (revisão contínua)
             self.s = F * L + self.z * self.protection_sigma(L)
             self.S = self.s + self.Q
-        elif cfg.policy in ("RS", "RSS"):
+        elif cfg.policy in PERIODIC:
             # período de proteção = L + R (o próximo pedido só sai daqui a R dias)
             self.s = F * (L + R) + self.z * self.protection_sigma(L + R)
-            self.S = self.s if cfg.policy == "RS" else self.s + self.Q
+            # (R,S) e POUT usam o mesmo nível-alvo S; a (R,s,S) soma o lote
+            self.S = self.s if cfg.policy in ("RS", "POUT") else self.s + self.Q
         elif cfg.policy == "L4L":
             pass  # base-stock fixo, definido uma única vez em make_policy_state
         elif cfg.policy == "ATUAL":
@@ -181,10 +223,22 @@ class PolicyState:
         """Arredonda a quantidade pedida: ao lot_size (políticas com lote) ou à unidade."""
         if q <= 0:
             return 0.0
-        if self.cfg.round_to_lot and self.cfg.policy in ("SQ", "RS", "RSS"):
+        if self.cfg.round_to_lot and self.cfg.policy in ("SQ",) + PERIODIC:
             lot = max(self.il.lot_size, 1)
             return float(math.ceil(q / lot) * lot)
         return float(math.ceil(q))
+
+    def pout_qty(self, ip: float) -> float:
+        """Quantidade da POUT (antes do arredondamento):
+            pedido = F·R + α·(S − IP − F·R)
+        F·R = demanda prevista até a próxima revisão. Com α = 1 o resultado é
+        S − IP (igual à (R, S)); com α < 1 só uma fração do desvio entre a
+        posição de estoque e o alvo é corrigida a cada revisão. Pedidos
+        negativos viram zero (não há devolução ao fornecedor)."""
+        R = max(1, int(self.cfg.review_period))
+        a = min(max(float(self.cfg.pout_alpha), 1e-6), 1.0)
+        base = self.forecast * R
+        return max(0.0, base + a * (self.S - ip - base))
 
 
 # ===========================================================================
@@ -212,6 +266,8 @@ def make_policy_state(il: ILParams, cfg: ScenarioConfig, lt_mean: float, lt_std:
     # previsão inicial = estatísticas do log (multiplicadas pelo fator de sensibilidade)
     d = il.daily_mean * cfg.demand_factor
     sd = max(il.daily_std * cfg.demand_factor, 1e-6)
+    # o planejador conhece a dispersão do lead time do cenário (σ_L × lead_time_spread)
+    lt_std = lt_std * max(float(getattr(cfg, "lead_time_spread", 1.0)), 0.0)
     st = PolicyState(il=il, cfg=cfg, z=z, L=lt_mean, sigma_L=lt_std, Q=eoq(il, cfg, d), forecast=d, sigma=sd)
     if cfg.policy == "L4L":
         # base-stock = demanda durante (L+1) dias + estoque de segurança
@@ -236,5 +292,28 @@ def default_scenarios() -> list[ScenarioConfig]:
         ScenarioConfig(policy="SQ", forecast="estatico"),
         ScenarioConfig(policy="RS", review_period=7, forecast="media_movel"),
         ScenarioConfig(policy="RSS", review_period=7, forecast="estatico"),
+        # POUT com a mesma revisão e previsão da (R,S): isola o efeito do α
+        ScenarioConfig(policy="POUT", review_period=7, forecast="media_movel", pout_alpha=0.5),
+        ScenarioConfig(policy="POUT", review_period=7, forecast="media_movel", pout_alpha=0.3),
         ScenarioConfig(policy="L4L", review_period=1, forecast="estatico"),
     ]
+
+
+# ===========================================================================
+# Dispersão do lead time
+# ===========================================================================
+def spread_lead_time(x: float, dist, spread: float) -> float:
+    """Aplica LT' = μ + k·(LT − μ) a um lead time sorteado x (k = spread),
+    com μ = média da distribuição ``dist`` do fornecedor.
+    Mantém a média e multiplica o desvio-padrão por k; o resultado nunca fica
+    negativo (lead times negativos não existem). Com k = 1 devolve x.
+    Obs.: com k grande, o corte em zero eleva um pouco a média efetiva."""
+    if spread == 1.0:
+        return max(0.0, x)
+    mean = dist.__dict__.get("_lt_mean")
+    if mean is None:  # calcula a média uma vez e guarda na própria distribuição
+        mean = float(dist.mean)
+        dist.__dict__["_lt_mean"] = mean
+    if not math.isfinite(mean):
+        return max(0.0, x)
+    return max(0.0, mean + spread * (x - mean))
